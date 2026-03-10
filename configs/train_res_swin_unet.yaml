@@ -1,0 +1,24 @@
+﻿image_dir: data/processed_images/images
+mask_dir: data/processed_images/masks
+epochs: 100
+batch_size: 4
+lr: 0.0001
+num_workers: 2
+img_size: 256
+val_ratio: 0.2
+seed: 42
+save_path: checkpoints/best_model.pth
+
+# Segmentation loss weights
+seg_focal_weight: 0.7
+seg_dice_weight: 0.3
+
+# Boundary branch / loss weights
+boundary_weight: 0.3
+boundary_bce_weight: 0.7
+boundary_dice_weight: 0.3
+boundary_radius: 1
+
+# Focal parameters
+focal_alpha: 0.25
+focal_gamma: 2.0

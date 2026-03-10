@@ -1,0 +1,26 @@
+import torch
+import torch.nn as nn
+
+
+class AttentionGate(nn.Module):
+    """Attention gate 用于 skip connections."""
+
+    def __init__(self, g_channels: int, x_channels: int, inter_channels: int):
+        super().__init__()
+        self.w_g = nn.Sequential(
+            nn.Conv2d(g_channels, inter_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(inter_channels),
+        )
+        self.w_x = nn.Sequential(
+            nn.Conv2d(x_channels, inter_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(inter_channels),
+        )
+        self.psi = nn.Sequential(
+            nn.Conv2d(inter_channels, 1, kernel_size=1, bias=True),
+            nn.Sigmoid(),
+        )
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, g: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        alpha = self.psi(self.relu(self.w_g(g) + self.w_x(x)))
+        return x * alpha + x

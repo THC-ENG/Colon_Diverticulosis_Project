@@ -1,0 +1,82 @@
+# ========== Python ==========
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ========== Virtual environments ==========
+venv/
+env/
+.venv/
+conda-env/
+*.env
+
+# ========== IDE / Editor ==========
+.vscode/
+.idea/
+
+# ========== Jupyter ==========
+.ipynb_checkpoints/
+
+# ========== OS files ==========
+.DS_Store
+Thumbs.db
+
+# ========== Logs ==========
+*.log
+logs/
+log/
+
+# ========== Model checkpoints / weights ==========
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.pkl
+checkpoints/
+weights/
+
+# ========== Training outputs ==========
+runs/
+outputs/
+experiments/
+cache/
+tmp/
+temp/
+
+# ========== Dataset ==========
+data/
+datasets/
+expert_dataset/
+medsam_dataset/
+pseudo_dataset/
+
+# ========== Result files ==========
+results/
+!results/.gitkeep
+
+# ========== Visualization / generated images ==========
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.tif
+*.tiff
+*.gif
+
+# But keep manually written docs/images if needed
+!docs/
+!assets/
+
+# ========== Annotation / masks cache ==========
+*.npy
+*.npz
+
+# ========== Testing / coverage ==========
+.coverage
+pytest_cache/
+.mypy_cache/
+
+# ========== Misc ==========
+*.bak
+*.swp
+*.tmp

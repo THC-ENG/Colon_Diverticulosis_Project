@@ -1,0 +1,52 @@
+Colon_Diverticulosis_Project/
+│
+├── data/                        # 存放所有数据
+│   ├── raw_images/              # 原始下载的数据 (Kvasir/HyperKvasir)
+│   ├── processed_images/                # 经过处理后的数据
+│         ├── images/
+│         │       ├── train/               # MedSAM生成并经清洗的训练集 (Img + Mask)
+│         │       ├── val/                 # 验证集
+│         │       └── test/                # 专家精标的测试集 (用于最终跑分)
+│         └── masks/
+│                  ├── train/
+│                  ├── val/
+│                  └── test/
+├── sam_checkpoint/          # 存放 MedSAM 的预训练权重 (medsam_vit_b.pth)
+│    └─ medsam_vit_b.pth
+├── medsam_tools/                # 【模块1】半自动标注工具箱
+│   ├── segment_anything/        # SAM 的官方底层代码库
+│   ├── auto_annotate.py         # 脚本：读取图片 -> 交互式画框 -> 调用MedSAM生成Mask
+│   └── visualization.py         # 脚本：把生成的Mask覆盖在原图上检查质量
+│
+├── models/                      # 【模块2】核心网络结构 (Res-Swin-Unet)
+│   ├── __init__.py
+│   ├── res_swin_unet.py         # 主网络文件，Encoder、Decoder 和跳跃连接（Skip Connections）组装在一起。
+│   ├── swin_transformer.py      # Swin Transformer 模块 (瓶颈层，全局语义)
+│   ├── resnet_encoder.py        # ResNet 编码器模块 (局部特征提取)
+│   └── attention_gate.py        # Attention Gate 模块 (跳跃连接抗噪)
+│
+├── utils/                        # 通用工具代码
+│   ├── dataset.py               # PyTorch DataLoader (读取图片和Mask，做数据增强)，可加入random flip，random brightness，elastic transform（医学常用）
+│   ├── metrics.py               # 计算 DSC, IoU, HD95 的公式
+│   └── losses.py                # 定义损失函数 (如 DiceLoss + CrossEntropy)
+│
+├── configs/                     # 配置文件 (可选，也可以直接写在train.py里)
+│   └── config.yaml              # 存放超参数：学习率、Batch Size、Epoch数
+│
+├── checkpoints/                # 训练过程中保存的模型权重
+│      ├── exp_01_baseline_unet/      # 实验1的权重
+│      │    ├── config.yaml
+│      │    ├── log.txt
+│      │    ├── best_model.pth           # 最优模型
+│      │    └── metrics.json
+│      │
+│      ├── exp_02_res_swin_unet/
+│      │    ├── ...
+│
+├── results/                     # 存放测试结果
+│   ├── prediction_maps/         # 存放模型预测出的分割图
+│   └── evaluation_report.txt    # 存放最终的评分表
+│
+├── train.py                     # 主训练脚本
+├── inference_eval.py                      # 测试脚本 (加载best_model.pth跑测试集)
+└── requirements.txt             # 环境依赖包列表
