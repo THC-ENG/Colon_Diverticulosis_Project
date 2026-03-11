@@ -1,0 +1,18 @@
+# Core runtime
+numpy>=1.24,<3.0
+opencv-python>=4.8
+tqdm>=4.66
+
+# PyTorch ecosystem
+# Tip: for CUDA, install torch/torchvision with the official index first.
+torch>=2.1
+torchvision>=0.16
+tensorboard>=2.14
+
+# SAM/MedSAM import used by:
+# from segment_anything import SamPredictor, sam_model_registry
+# If you already did:
+#   pip install -e "D:\Embodied AI\SAM\MedSAM"
+# then segment_anything is provided by that repo.
+# Do not mix with a different segment-anything build unless you know
+# it is API-compatible with your MedSAM codebase.
