@@ -22,23 +22,44 @@ def generate_boundary_label(mask: np.ndarray, radius: int = 1) -> np.ndarray:
 
 
 class ColonDataset(Dataset):
-    def __init__(self, image_dir, mask_dir, transform=None, boundary_radius: int = 1):
+    def __init__(
+        self,
+        image_dir,
+        mask_dir,
+        transform=None,
+        use_boundary: bool = False,
+        boundary_radius: int = 1,
+    ):
         self.image_dir = Path(image_dir)
         self.mask_dir = Path(mask_dir)
         self.transform = transform
+        self.use_boundary = use_boundary
         self.boundary_radius = boundary_radius
 
-        exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+        self.exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
         self.image_files = sorted(
-            [p for p in self.image_dir.glob("*") if p.suffix.lower() in exts]
+            [p for p in self.image_dir.glob("*") if p.suffix.lower() in self.exts]
         )
 
     def __len__(self):
         return len(self.image_files)
 
+    def _find_mask_path(self, image_path: Path) -> Path:
+        # Prefer same filename (including suffix), then fallback to common mask suffixes.
+        same_name = self.mask_dir / image_path.name
+        if same_name.exists():
+            return same_name
+
+        for suffix in [".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"]:
+            candidate = self.mask_dir / f"{image_path.stem}{suffix}"
+            if candidate.exists():
+                return candidate
+
+        raise ValueError(f"Cannot find matching mask for image: {image_path}")
+
     def __getitem__(self, idx):
         img_path = self.image_files[idx]
-        mask_path = self.mask_dir / f"{img_path.stem}.png"
+        mask_path = self._find_mask_path(img_path)
 
         image = cv2.imread(str(img_path))
         if image is None:
@@ -53,15 +74,19 @@ class ColonDataset(Dataset):
             image, mask = self.transform(image, mask)
 
         mask_bin = (mask > 0).astype(np.uint8)
-        boundary = generate_boundary_label(mask_bin, radius=self.boundary_radius)
 
         image_tensor = torch.from_numpy(image.astype(np.float32) / 255.0).permute(2, 0, 1)
         mask_tensor = torch.from_numpy(mask_bin.astype(np.float32)).unsqueeze(0)
-        boundary_tensor = torch.from_numpy(boundary).unsqueeze(0)
 
-        return {
+        sample = {
             "id": img_path.stem,
             "image": image_tensor,
             "mask": mask_tensor,
-            "boundary": boundary_tensor,
         }
+
+        if self.use_boundary:
+            boundary = generate_boundary_label(mask_bin, radius=self.boundary_radius)
+            boundary_tensor = torch.from_numpy(boundary).unsqueeze(0)
+            sample["boundary"] = boundary_tensor
+
+        return sample

@@ -1,4 +1,4 @@
-import torch
+﻿import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -37,7 +37,7 @@ class WindowAttention(nn.Module):
         self.attn = nn.MultiheadAttention(
             dim,
             num_heads,
-            batch_first=True
+            batch_first=True,
         )
         self.window_size = window_size
 
@@ -87,9 +87,9 @@ class SwinStage(nn.Module):
         num_heads,
         depth=2,
         window_size=8,
+        use_shifted_window=True,
     ):
         super().__init__()
-        
 
         self.downsample = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, 3, stride=2, padding=1),
@@ -104,7 +104,7 @@ class SwinStage(nn.Module):
                     dim=out_channels,
                     num_heads=num_heads,
                     window_size=window_size,
-                    shift=False,  # 奇数层做shift
+                    shift=(use_shifted_window and (i % 2 == 1)),
                 )
             )
 
@@ -114,7 +114,7 @@ class SwinStage(nn.Module):
         x = self.downsample(x)
         B, C, H, W = x.shape
 
-        x = x.permute(0, 2, 3, 1)  # B H W C
+        x = x.permute(0, 2, 3, 1)
 
         for block in self.blocks:
             x = block(x)

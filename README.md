@@ -19,7 +19,7 @@ This repository is designed as both a **research codebase** and a **project home
 
 - Built a complete pipeline for **lesion segmentation** in colonoscopy images
 - Deployed and evaluated **SAM / MedSAM** for annotation assistance
-- Implemented a **Res/Swin-UNet-style segmentation framework**
+- Implemented a **Res-Swin-UNet style segmentation framework**
 - Constructed both **pseudo-labeled** and **expert-labeled** datasets
 - Exploring **dual-task supervision** with segmentation and boundary learning
 - Continuously improving performance on **small, high-quality medical datasets**

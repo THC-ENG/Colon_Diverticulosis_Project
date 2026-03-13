@@ -1,24 +1,37 @@
-﻿image_dir: data/processed_images/images
+﻿# Data
+# For expert dataset, pass --dataset-root data/expert_dataset
+image_dir: data/processed_images/images
 mask_dir: data/processed_images/masks
+train_image_dir: data/processed_images/images/train
+train_mask_dir: data/processed_images/masks/train
+val_image_dir: data/processed_images/images/val
+val_mask_dir: data/processed_images/masks/val
+
 epochs: 100
 batch_size: 4
 lr: 0.0001
 num_workers: 2
 img_size: 256
-val_ratio: 0.2
 seed: 42
 save_path: checkpoints/best_model.pth
 
-# Segmentation loss weights
+# Toggle: baseline(False) vs dual-task(True)
+use_boundary: false
+
+# Segmentation loss weights (Focal + Dice)
 seg_focal_weight: 0.7
 seg_dice_weight: 0.3
 
-# Boundary branch / loss weights
+# Boundary branch / loss weights (effective when use_boundary=true)
 boundary_weight: 0.3
-boundary_bce_weight: 0.7
-boundary_dice_weight: 0.3
+boundary_bce_weight: 1.0
+boundary_dice_weight: 0.0
 boundary_radius: 1
 
 # Focal parameters
 focal_alpha: 0.25
 focal_gamma: 2.0
+
+# Suggested ablation setups:
+# A) Baseline: use_boundary=false
+# B) Dual-task: use_boundary=true, boundary_bce_weight=1.0, boundary_dice_weight=0.0

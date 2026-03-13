@@ -89,24 +89,24 @@ def _load_model_state(model: torch.nn.Module, state_dict: dict):
     if seg_missing:
         raise RuntimeError(
             "Checkpoint is missing segmentation head weights. "
-            "This usually means incompatible checkpoint architecture. "
             f"Missing keys: {seg_missing}"
         )
 
-    boundary_missing = [k for k in missing if k.startswith("boundary_head.")]
-    boundary_head_ready = len(boundary_missing) == 0
+    boundary_head_ready = True
+    if model.use_boundary:
+        boundary_missing = [k for k in missing if k.startswith("boundary_head.")]
+        boundary_head_ready = len(boundary_missing) == 0
+        if not boundary_head_ready:
+            print(
+                "[checkpoint warning] boundary_head weights are missing. "
+                "Boundary map will fallback to morphology boundary from predicted segmentation."
+            )
 
     if remapped:
         print("[checkpoint] mapped legacy keys head.* -> seg_head.*")
     if missing or unexpected:
         print(f"[checkpoint] missing_keys={missing}")
         print(f"[checkpoint] unexpected_keys={unexpected}")
-
-    if not boundary_head_ready:
-        print(
-            "[checkpoint warning] boundary_head weights are missing. "
-            "Boundary map will fallback to morphology boundary from predicted segmentation."
-        )
 
     return boundary_head_ready
 
@@ -124,6 +124,7 @@ def main():
     parser.add_argument("--report-path", type=str, default="results/metrics_report.json")
     parser.add_argument("--pred-threshold", type=float, default=0.5)
 
+    parser.add_argument("--use-boundary", action="store_true")
     parser.add_argument("--save-boundary", action="store_true")
     parser.add_argument("--boundary-dir", type=str, default="results/boundary_maps")
     parser.add_argument("--boundary-threshold", type=float, default=0.5)
@@ -141,6 +142,7 @@ def main():
         args.image_dir,
         args.mask_dir,
         transform=ValAugmentor((args.img_size, args.img_size)),
+        use_boundary=False,
     )
     loader = DataLoader(
         dataset,
@@ -150,11 +152,16 @@ def main():
         pin_memory=True,
     )
 
-    model = ResSwinUNet(num_classes=1).to(args.device)
     ckpt = _load_checkpoint(args.checkpoint, args.device)
+    ckpt_use_boundary = bool(ckpt.get("use_boundary", False)) if isinstance(ckpt, dict) else False
+    effective_use_boundary = args.use_boundary or ckpt_use_boundary
+
+    model = ResSwinUNet(num_classes=1, use_boundary=effective_use_boundary).to(args.device)
     state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     boundary_head_ready = _load_model_state(model, state_dict)
     model.eval()
+
+    print(f"[eval mode] {'dual_task_boundary' if effective_use_boundary else 'baseline'}")
 
     dices, ious = [], []
     with torch.no_grad():
@@ -163,7 +170,12 @@ def main():
             masks = batch["mask"].to(args.device)
             ids = batch["id"]
 
-            seg_logits, boundary_logits = model(images)
+            outputs = model(images)
+            if isinstance(outputs, (tuple, list)):
+                seg_logits, boundary_logits = outputs
+            else:
+                seg_logits = outputs
+                boundary_logits = None
 
             d = dice_coeff(seg_logits, masks).item()
             i = iou_score(seg_logits, masks).item()
@@ -171,7 +183,8 @@ def main():
             ious.append(i)
 
             seg_probs = torch.sigmoid(seg_logits)
-            if boundary_head_ready:
+
+            if boundary_logits is not None and boundary_head_ready:
                 boundary_probs = torch.sigmoid(boundary_logits)
             else:
                 boundary_list = [

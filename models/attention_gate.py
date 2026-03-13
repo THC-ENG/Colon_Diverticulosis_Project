@@ -23,4 +23,4 @@ class AttentionGate(nn.Module):
 
     def forward(self, g: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         alpha = self.psi(self.relu(self.w_g(g) + self.w_x(x)))
-        return x * alpha + x
+        return x * alpha

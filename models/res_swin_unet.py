@@ -46,11 +46,13 @@ class ResSwinUNet(nn.Module):
         swin_heads_stage4: int = 8,
         swin_depth_stage3: int = 2,
         swin_depth_stage4: int = 2,
+        use_boundary: bool = False,
     ):
         super().__init__()
         if in_channels != 3:
             raise ValueError("Current ResNet encoder implementation expects in_channels=3.")
 
+        self.use_boundary = use_boundary
         self.encoder = ResNetShallowEncoder(pretrained=encoder_pretrained)
 
         self.swin_stage3 = SwinStage(
@@ -73,9 +75,9 @@ class ResSwinUNet(nn.Module):
 
         self.final_up = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
         self.seg_head = nn.Conv2d(32, num_classes, kernel_size=1)
-        self.boundary_head = nn.Conv2d(32, 1, kernel_size=1)
+        self.boundary_head = nn.Conv2d(32, 1, kernel_size=1) if use_boundary else None
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor):
         x0, x1, x2 = self.encoder(x)
         x3 = self.swin_stage3(x2)
         x4 = self.swin_stage4(x3)
@@ -87,5 +89,9 @@ class ResSwinUNet(nn.Module):
 
         final_feat = self.final_up(d1)
         seg_logits = self.seg_head(final_feat)
+
+        if not self.use_boundary:
+            return seg_logits
+
         boundary_logits = self.boundary_head(final_feat)
         return seg_logits, boundary_logits
