@@ -2,6 +2,8 @@
 numpy>=1.24,<3.0
 opencv-python>=4.8
 tqdm>=4.66
+pyyaml>=6.0
+scipy>=1.10
 
 # PyTorch ecosystem
 # Tip: for CUDA, install torch/torchvision with the official index first.

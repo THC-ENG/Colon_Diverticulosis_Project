@@ -92,6 +92,7 @@ class DualTaskLoss(nn.Module):
         boundary_logits: torch.Tensor,
         seg_targets: torch.Tensor,
         boundary_targets: torch.Tensor,
+        boundary_weight_override: float | None = None,
     ):
         seg_focal_loss = self.seg_focal(seg_logits, seg_targets)
         seg_dice_loss = self.seg_dice(seg_logits, seg_targets)
@@ -104,7 +105,8 @@ class DualTaskLoss(nn.Module):
             + self.boundary_dice_weight * boundary_dice_loss
         )
 
-        total_loss = seg_total + self.boundary_weight * boundary_total
+        boundary_weight = self.boundary_weight if boundary_weight_override is None else boundary_weight_override
+        total_loss = seg_total + boundary_weight * boundary_total
 
         stats = {
             "seg_focal": seg_focal_loss.detach(),
@@ -113,5 +115,6 @@ class DualTaskLoss(nn.Module):
             "boundary_bce": boundary_bce_loss.detach(),
             "boundary_dice": boundary_dice_loss.detach(),
             "boundary_total": boundary_total.detach(),
+            "boundary_weight": torch.tensor(boundary_weight, device=seg_logits.device),
         }
         return total_loss, stats

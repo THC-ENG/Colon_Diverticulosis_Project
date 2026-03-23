@@ -22,6 +22,9 @@ def generate_boundary_label(mask: np.ndarray, radius: int = 1) -> np.ndarray:
 
 
 class ColonDataset(Dataset):
+    IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
     def __init__(
         self,
         image_dir,
@@ -29,17 +32,20 @@ class ColonDataset(Dataset):
         transform=None,
         use_boundary: bool = False,
         boundary_radius: int = 1,
+        include_ids: set[str] | None = None,
     ):
         self.image_dir = Path(image_dir)
         self.mask_dir = Path(mask_dir)
         self.transform = transform
         self.use_boundary = use_boundary
         self.boundary_radius = boundary_radius
+        self.include_ids = include_ids
 
         self.exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
-        self.image_files = sorted(
-            [p for p in self.image_dir.glob("*") if p.suffix.lower() in self.exts]
-        )
+        files = [p for p in self.image_dir.glob("*") if p.suffix.lower() in self.exts]
+        if self.include_ids is not None:
+            files = [p for p in files if p.stem in self.include_ids]
+        self.image_files = sorted(files)
 
     def __len__(self):
         return len(self.image_files)
@@ -75,7 +81,10 @@ class ColonDataset(Dataset):
 
         mask_bin = (mask > 0).astype(np.uint8)
 
-        image_tensor = torch.from_numpy(image.astype(np.float32) / 255.0).permute(2, 0, 1)
+        image_f = image.astype(np.float32) / 255.0
+        image_f = (image_f - self.IMAGENET_MEAN) / self.IMAGENET_STD
+
+        image_tensor = torch.from_numpy(image_f).permute(2, 0, 1)
         mask_tensor = torch.from_numpy(mask_bin.astype(np.float32)).unsqueeze(0)
 
         sample = {

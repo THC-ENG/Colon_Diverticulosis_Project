@@ -1,11 +1,11 @@
+# Expert feasibility config (single-stage only)
+
 # Data
-# For expert dataset, pass --dataset-root data/expert_dataset
-image_dir: data/processed_images/images
-mask_dir: data/processed_images/masks
-train_image_dir: data/processed_images/images/train
-train_mask_dir: data/processed_images/masks/train
-val_image_dir: data/processed_images/images/val
-val_mask_dir: data/processed_images/masks/val
+dataset_root: data/expert_dataset
+train_image_dir: data/expert_dataset/images/train
+train_mask_dir: data/expert_dataset/masks/train
+val_image_dir: data/expert_dataset/images/val
+val_mask_dir: data/expert_dataset/masks/val
 all_image_dir: ""
 all_mask_dir: ""
 split_json: ""
@@ -22,9 +22,9 @@ grad_clip_norm: 1.0
 num_workers: 2
 img_size: 256
 seed: 42
-save_path: checkpoints/best_model.pth
+save_path: checkpoints/expert_feasibility_baseline.pth
 init_checkpoint: ""
-run_name: ""
+run_name: expert_feasibility_baseline
 
 # Runtime
 device: cuda
@@ -41,14 +41,14 @@ ds_weight_d2: 0.4
 ds_weight_d3: 0.2
 ds_weight_d4: 0.1
 
-# Toggle: baseline(False) vs dual-task(True)
+# Toggle: baseline first
 use_boundary: false
 
-# Segmentation loss weights (Focal + Dice)
+# Segmentation loss weights
 seg_focal_weight: 0.7
 seg_dice_weight: 0.3
 
-# Boundary branch / loss weights (effective when use_boundary=true)
+# Boundary branch params (effective only when use_boundary=true)
 boundary_weight: 0.3
 boundary_bce_weight: 1.0
 boundary_dice_weight: 0.0
@@ -58,8 +58,3 @@ boundary_warmup_ratio: 0.3
 # Focal parameters
 focal_alpha: 0.25
 focal_gamma: 2.0
-
-# Suggested ablation setups:
-# A) Baseline: use_boundary=false
-# B) +Swin fixes: keep defaults above
-# C) +Boundary: use_boundary=true

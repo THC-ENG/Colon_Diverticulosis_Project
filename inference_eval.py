@@ -1,4 +1,4 @@
-﻿import argparse
+import argparse
 import json
 import os
 from pathlib import Path
@@ -12,7 +12,66 @@ from tqdm import tqdm
 from models.res_swin_unet import ResSwinUNet
 from utils.augmentations import ValAugmentor
 from utils.dataset import ColonDataset
-from utils.metrics import dice_coeff, iou_score
+from utils.metrics import (
+    boundary_f1_from_masks,
+    dice_per_sample,
+    hd95_from_masks,
+    iou_per_sample,
+    mask_to_boundary,
+)
+
+
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+def _parse_model_outputs(outputs):
+    parsed = {
+        "seg": None,
+        "boundary": None,
+        "aux": [],
+    }
+
+    if isinstance(outputs, dict):
+        parsed["seg"] = outputs.get("seg")
+        parsed["boundary"] = outputs.get("boundary")
+        parsed["aux"] = outputs.get("aux") or []
+        return parsed
+
+    if isinstance(outputs, (tuple, list)):
+        if len(outputs) >= 1:
+            parsed["seg"] = outputs[0]
+        if len(outputs) >= 2:
+            parsed["boundary"] = outputs[1]
+        if len(outputs) >= 3:
+            parsed["aux"] = outputs[2] if outputs[2] is not None else []
+        return parsed
+
+    parsed["seg"] = outputs
+    return parsed
+
+
+def _parse_threshold_range(text: str) -> list[float]:
+    items = [v.strip() for v in text.split(",") if v.strip()]
+    if len(items) != 3:
+        raise ValueError("--threshold-range must be in format: start,end,step")
+
+    start, end, step = map(float, items)
+    if step <= 0:
+        raise ValueError("threshold step must be > 0")
+    if end < start:
+        raise ValueError("threshold end must be >= start")
+
+    values = []
+    cur = start
+    while cur <= end + 1e-8:
+        values.append(float(round(cur, 4)))
+        cur += step
+    return values
+
+
+def _to_mask_np(mask_tensor: torch.Tensor) -> np.ndarray:
+    return (mask_tensor.squeeze().detach().cpu().numpy() > 0.5).astype(np.uint8)
 
 
 def save_comparison_grid(
@@ -22,10 +81,11 @@ def save_comparison_grid(
     path: Path,
     pred_threshold: float = 0.5,
 ):
-    img_np = (image_tensor.cpu().numpy().transpose(1, 2, 0) * 255.0).astype(np.uint8)
-    img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+    img = image_tensor.detach().cpu().numpy().transpose(1, 2, 0)
+    img = np.clip(img * IMAGENET_STD + IMAGENET_MEAN, 0.0, 1.0)
+    img_bgr = cv2.cvtColor((img * 255.0).astype(np.uint8), cv2.COLOR_RGB2BGR)
 
-    gt_np = (gt_tensor.squeeze().cpu().numpy() * 255).astype(np.uint8)
+    gt_np = (gt_tensor.squeeze().cpu().numpy() > 0.5).astype(np.uint8) * 255
     gt_bgr = cv2.cvtColor(gt_np, cv2.COLOR_GRAY2BGR)
 
     pred_np = (pred_prob.squeeze().cpu().numpy() > pred_threshold).astype(np.uint8) * 255
@@ -39,6 +99,38 @@ def save_comparison_grid(
     cv2.imwrite(str(path), grid)
 
 
+def save_boundary_probability_heatmap(
+    boundary_prob: torch.Tensor,
+    path: Path,
+    upscale: int = 4,
+):
+    prob = boundary_prob.squeeze().detach().cpu().numpy().astype(np.float32)
+    prob = np.nan_to_num(prob, nan=0.0, posinf=1.0, neginf=0.0)
+
+    lo, hi = np.percentile(prob, (1.0, 99.0))
+    if float(hi - lo) < 1e-8:
+        lo = float(prob.min())
+        hi = float(prob.max())
+
+    if float(hi - lo) < 1e-8:
+        norm_u8 = np.zeros_like(prob, dtype=np.uint8)
+    else:
+        norm = np.clip((prob - lo) / (hi - lo + 1e-8), 0.0, 1.0)
+        norm_u8 = (norm * 255.0).astype(np.uint8)
+
+    heatmap = cv2.applyColorMap(norm_u8, cv2.COLORMAP_TURBO)
+
+    if upscale > 1:
+        h, w = heatmap.shape[:2]
+        heatmap = cv2.resize(
+            heatmap,
+            (w * upscale, h * upscale),
+            interpolation=cv2.INTER_CUBIC,
+        )
+
+    cv2.imwrite(str(path), heatmap)
+
+
 def _load_checkpoint(path: str, device: str):
     try:
         return torch.load(path, map_location=device, weights_only=True)
@@ -46,21 +138,9 @@ def _load_checkpoint(path: str, device: str):
         return torch.load(path, map_location=device)
 
 
-def _morph_boundary_from_mask(mask_bin: np.ndarray, radius: int = 1) -> np.ndarray:
-    if mask_bin.sum() == 0:
-        return np.zeros_like(mask_bin, dtype=np.float32)
-
-    radius = max(1, int(radius))
-    k = 2 * radius + 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    dil = cv2.dilate(mask_bin, kernel, iterations=1)
-    ero = cv2.erode(mask_bin, kernel, iterations=1)
-    return ((dil - ero) > 0).astype(np.float32)
-
-
 def _boundary_from_seg_prob(seg_prob: torch.Tensor, threshold: float, radius: int) -> torch.Tensor:
     seg_np = (seg_prob.squeeze().cpu().numpy() > threshold).astype(np.uint8)
-    boundary_np = _morph_boundary_from_mask(seg_np, radius=radius)
+    boundary_np = mask_to_boundary(seg_np, radius=radius).astype(np.float32)
     return torch.from_numpy(boundary_np).to(seg_prob.device)
 
 
@@ -111,10 +191,48 @@ def _load_model_state(model: torch.nn.Module, state_dict: dict):
     return boundary_head_ready
 
 
+def _build_loader(image_dir: str, mask_dir: str, img_size: int, batch_size: int, num_workers: int):
+    dataset = ColonDataset(
+        image_dir,
+        mask_dir,
+        transform=ValAugmentor((img_size, img_size)),
+        use_boundary=False,
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+    return dataset, loader
+
+
+def _search_best_threshold(model, loader, device: str, thresholds: list[float]) -> float:
+    scores = {th: [] for th in thresholds}
+
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="Threshold Search"):
+            images = batch["image"].to(device)
+            masks = batch["mask"].to(device)
+
+            parsed = _parse_model_outputs(model(images))
+            seg_logits = parsed["seg"]
+            for th in thresholds:
+                d = dice_per_sample(seg_logits, masks, threshold=th)
+                scores[th].extend(d.cpu().tolist())
+
+    best_th = max(thresholds, key=lambda t: float(np.mean(scores[t])) if scores[t] else -1.0)
+    return float(best_th)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--image-dir", type=str, default="data/processed_images/images/test")
     parser.add_argument("--mask-dir", type=str, default="data/processed_images/masks/test")
+    parser.add_argument("--val-image-dir", type=str, default="")
+    parser.add_argument("--val-mask-dir", type=str, default="")
+
     parser.add_argument("--checkpoint", type=str, default="checkpoints/best_model.pth")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=2)
@@ -122,14 +240,18 @@ def main():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--save-dir", type=str, default="results/preds_comparison")
     parser.add_argument("--report-path", type=str, default="results/metrics_report.json")
+    parser.add_argument("--per-sample-report", type=str, default="")
     parser.add_argument("--pred-threshold", type=float, default=0.5)
 
-    parser.add_argument("--use-boundary", action="store_true")
-    parser.add_argument("--save-boundary", action="store_true")
+    parser.add_argument("--threshold-search", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--threshold-range", type=str, default="0.30,0.70,0.02")
+    parser.add_argument("--report-boundary-metrics", action=argparse.BooleanOptionalAction, default=True)
+
+    parser.add_argument("--use-boundary", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--save-boundary", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--boundary-dir", type=str, default="results/boundary_maps")
-    parser.add_argument("--boundary-threshold", type=float, default=0.5)
     parser.add_argument("--boundary-radius", type=int, default=1)
-    parser.add_argument("--boundary-save-mode", type=str, choices=["binary", "heatmap"], default="binary")
+    parser.add_argument("--boundary-heatmap-scale", type=int, default=4)
 
     args = parser.parse_args()
 
@@ -138,49 +260,73 @@ def main():
     if args.save_boundary:
         os.makedirs(args.boundary_dir, exist_ok=True)
 
-    dataset = ColonDataset(
-        args.image_dir,
-        args.mask_dir,
-        transform=ValAugmentor((args.img_size, args.img_size)),
-        use_boundary=False,
-    )
-    loader = DataLoader(
-        dataset,
+    test_dataset, test_loader = _build_loader(
+        image_dir=args.image_dir,
+        mask_dir=args.mask_dir,
+        img_size=args.img_size,
         batch_size=args.batch_size,
-        shuffle=False,
         num_workers=args.num_workers,
-        pin_memory=True,
     )
 
     ckpt = _load_checkpoint(args.checkpoint, args.device)
     ckpt_use_boundary = bool(ckpt.get("use_boundary", False)) if isinstance(ckpt, dict) else False
-    effective_use_boundary = args.use_boundary or ckpt_use_boundary
+    model_kwargs = ckpt.get("model_kwargs", {}) if isinstance(ckpt, dict) else {}
+    if not isinstance(model_kwargs, dict):
+        model_kwargs = {}
 
-    model = ResSwinUNet(num_classes=1, use_boundary=effective_use_boundary).to(args.device)
+    effective_use_boundary = args.use_boundary or ckpt_use_boundary or bool(model_kwargs.get("use_boundary", False))
+    model_kwargs = dict(model_kwargs)
+    model_kwargs["num_classes"] = int(model_kwargs.get("num_classes", 1))
+    model_kwargs["use_boundary"] = effective_use_boundary
+
+    model = ResSwinUNet(**model_kwargs).to(args.device)
     state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     boundary_head_ready = _load_model_state(model, state_dict)
     model.eval()
 
     print(f"[eval mode] {'dual_task_boundary' if effective_use_boundary else 'baseline'}")
 
-    dices, ious = [], []
+    threshold_used = float(args.pred_threshold)
+    threshold_source = "fixed"
+    if args.threshold_search:
+        thresholds = _parse_threshold_range(args.threshold_range)
+        if args.val_image_dir and args.val_mask_dir:
+            _, search_loader = _build_loader(
+                image_dir=args.val_image_dir,
+                mask_dir=args.val_mask_dir,
+                img_size=args.img_size,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+            )
+            threshold_source = "val"
+        else:
+            search_loader = test_loader
+            threshold_source = "test_fallback"
+            print("[threshold search warning] val dirs not provided, falling back to test set search.")
+
+        threshold_used = _search_best_threshold(model, search_loader, args.device, thresholds)
+        print(f"[threshold search] best threshold={threshold_used:.4f} source={threshold_source}")
+
+    dice_values = []
+    iou_values = []
+    boundary_f1_values = []
+    hd95_values = []
+    sample_rows = []
+
     with torch.no_grad():
-        for batch in tqdm(loader, desc="Inference"):
+        for batch in tqdm(test_loader, desc="Inference"):
             images = batch["image"].to(args.device)
             masks = batch["mask"].to(args.device)
             ids = batch["id"]
 
-            outputs = model(images)
-            if isinstance(outputs, (tuple, list)):
-                seg_logits, boundary_logits = outputs
-            else:
-                seg_logits = outputs
-                boundary_logits = None
+            parsed = _parse_model_outputs(model(images))
+            seg_logits = parsed["seg"]
+            boundary_logits = parsed["boundary"]
 
-            d = dice_coeff(seg_logits, masks).item()
-            i = iou_score(seg_logits, masks).item()
-            dices.append(d)
-            ious.append(i)
+            d = dice_per_sample(seg_logits, masks, threshold=threshold_used)
+            i = iou_per_sample(seg_logits, masks, threshold=threshold_used)
+            dice_values.extend(d.cpu().tolist())
+            iou_values.extend(i.cpu().tolist())
 
             seg_probs = torch.sigmoid(seg_logits)
 
@@ -188,7 +334,7 @@ def main():
                 boundary_probs = torch.sigmoid(boundary_logits)
             else:
                 boundary_list = [
-                    _boundary_from_seg_prob(seg_probs[j], args.pred_threshold, args.boundary_radius)
+                    _boundary_from_seg_prob(seg_probs[j], threshold_used, args.boundary_radius)
                     for j in range(seg_probs.size(0))
                 ]
                 boundary_probs = torch.stack(boundary_list, dim=0).unsqueeze(1)
@@ -199,27 +345,62 @@ def main():
                     gt_tensor=masks[j],
                     pred_prob=seg_probs[j],
                     path=Path(args.save_dir) / f"{sample_id}_eval.png",
-                    pred_threshold=args.pred_threshold,
+                    pred_threshold=threshold_used,
                 )
 
+                pred_mask_np = (seg_probs[j].squeeze().cpu().numpy() > threshold_used).astype(np.uint8)
+                gt_mask_np = _to_mask_np(masks[j])
+                row = {
+                    "id": sample_id,
+                    "dice": float(d[j].item()),
+                    "iou": float(i[j].item()),
+                }
+
+                if args.report_boundary_metrics:
+                    bf1 = boundary_f1_from_masks(pred_mask_np, gt_mask_np, boundary_radius=args.boundary_radius)
+                    h95 = hd95_from_masks(pred_mask_np, gt_mask_np)
+                    boundary_f1_values.append(bf1)
+                    hd95_values.append(h95)
+                    row["boundary_f1"] = float(bf1)
+                    row["hd95"] = float(h95)
+
+                prob = torch.clamp(seg_probs[j], min=1e-6, max=1.0 - 1e-6)
+                entropy = -(prob * torch.log(prob) + (1.0 - prob) * torch.log(1.0 - prob)).mean()
+                row["uncertainty_entropy"] = float(entropy.item())
+                sample_rows.append(row)
+
                 if args.save_boundary:
-                    boundary_np = boundary_probs[j].squeeze().cpu().numpy()
-                    if args.boundary_save_mode == "binary":
-                        boundary_map = (boundary_np > args.boundary_threshold).astype(np.uint8) * 255
-                    else:
-                        boundary_map = (np.clip(boundary_np, 0.0, 1.0) * 255.0).astype(np.uint8)
-                    cv2.imwrite(str(Path(args.boundary_dir) / f"{sample_id}_boundary.png"), boundary_map)
+                    save_boundary_probability_heatmap(
+                        boundary_prob=boundary_probs[j],
+                        path=Path(args.boundary_dir) / f"{sample_id}_boundary.png",
+                        upscale=max(1, args.boundary_heatmap_scale),
+                    )
 
     report = {
-        "num_samples": len(dataset),
-        "dice_mean": float(np.mean(dices)),
-        "dice_std": float(np.std(dices)),
-        "iou_mean": float(np.mean(ious)),
-        "iou_std": float(np.std(ious)),
+        "num_samples": len(test_dataset),
+        "threshold_used": float(threshold_used),
+        "threshold_source": threshold_source,
+        "dice_mean": float(np.mean(dice_values)) if dice_values else 0.0,
+        "dice_std": float(np.std(dice_values)) if dice_values else 0.0,
+        "iou_mean": float(np.mean(iou_values)) if iou_values else 0.0,
+        "iou_std": float(np.std(iou_values)) if iou_values else 0.0,
     }
+
+    if args.report_boundary_metrics:
+        report["boundary_f1_mean"] = float(np.mean(boundary_f1_values)) if boundary_f1_values else 0.0
+        report["boundary_f1_std"] = float(np.std(boundary_f1_values)) if boundary_f1_values else 0.0
+        report["hd95_mean"] = float(np.mean(hd95_values)) if hd95_values else 0.0
+        report["hd95_std"] = float(np.std(hd95_values)) if hd95_values else 0.0
 
     with open(args.report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
+
+    if args.per_sample_report:
+        per_sample_path = Path(args.per_sample_report)
+        per_sample_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(per_sample_path, "w", encoding="utf-8") as f:
+            json.dump(sample_rows, f, indent=2, ensure_ascii=False)
+        print(f"[Per-sample report saved to] {per_sample_path}")
 
     print("\n=== Evaluation Report ===")
     print(json.dumps(report, indent=2, ensure_ascii=False))

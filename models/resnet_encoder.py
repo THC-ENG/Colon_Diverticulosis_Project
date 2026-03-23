@@ -23,7 +23,7 @@ class ResNetShallowEncoder(nn.Module):
         self.layer4 = backbone.layer4
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-        x0 = self.relu(self.bn1(self.conv1(x)))     # 1/2, 64
-        x1 = self.layer1(self.maxpool(x0))          # 1/4, 64
-        x2 = self.layer2(x1)                        # 1/8, 128
+        x0 = self.relu(self.bn1(self.conv1(x)))     # 1/2, 64 , [B, 64, H/2, W/2]
+        x1 = self.layer1(self.maxpool(x0))          # 1/4, 64 , [B, 64, H/4, W/4]
+        x2 = self.layer2(x1)                        # 1/8, 128 , [B, 128, H/8, W/8]
         return x0, x1, x2
