@@ -171,3 +171,35 @@ class ValAugmentor:
 
     def __call__(self, image: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         return _resize_pair(image, mask, self.out_size)
+
+
+class DistillTrainAugmentor:
+    def __init__(
+        self,
+        out_size: Tuple[int, int] = (256, 256),
+        hflip_prob: float = 0.5,
+        vflip_prob: float = 0.2,
+        blur_prob: float = 0.15,
+    ):
+        self.out_size = out_size
+        self.hflip_prob = hflip_prob
+        self.vflip_prob = vflip_prob
+        self.blur_prob = blur_prob
+
+    def __call__(self, image: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        if random.random() < self.hflip_prob:
+            image = cv2.flip(image, 1)
+            mask = cv2.flip(mask, 1)
+        if random.random() < self.vflip_prob:
+            image = cv2.flip(image, 0)
+            mask = cv2.flip(mask, 0)
+
+        alpha = random.uniform(0.92, 1.08)
+        beta = random.uniform(-10.0, 10.0)
+        image = cv2.convertScaleAbs(image, alpha=alpha, beta=beta)
+
+        if random.random() < self.blur_prob:
+            image = cv2.GaussianBlur(image, (3, 3), sigmaX=0)
+
+        mask = ((mask > 0).astype(np.uint8) * 255)
+        return _resize_pair(image, mask, self.out_size)

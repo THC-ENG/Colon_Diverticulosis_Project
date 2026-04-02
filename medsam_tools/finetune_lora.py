@@ -1,4 +1,5 @@
 import argparse
+import csv
 import os
 import random
 from pathlib import Path
@@ -28,8 +29,11 @@ class LoRALinear(nn.Module):
         self.base = base
         self.rank = rank
         self.scale = alpha / max(rank, 1)
-        self.lora_a = nn.Parameter(torch.zeros(rank, base.in_features))
-        self.lora_b = nn.Parameter(torch.zeros(base.out_features, rank))
+        # Keep LoRA params on the same device/dtype as the wrapped linear layer.
+        dev = base.weight.device
+        dt = base.weight.dtype
+        self.lora_a = nn.Parameter(torch.zeros(rank, base.in_features, device=dev, dtype=dt))
+        self.lora_b = nn.Parameter(torch.zeros(base.out_features, rank, device=dev, dtype=dt))
         nn.init.kaiming_uniform_(self.lora_a, a=np.sqrt(5))
         nn.init.zeros_(self.lora_b)
 
@@ -43,35 +47,85 @@ def inject_lora(module: nn.Module, target_keywords: List[str], rank: int, alpha:
     replaced = 0
     for name, child in list(module.named_children()):
         if isinstance(child, nn.Linear) and any(k in name.lower() for k in target_keywords):
-            setattr(module, name, LoRALinear(child, rank=rank, alpha=alpha))
+            lora = LoRALinear(child, rank=rank, alpha=alpha)
+            lora = lora.to(device=child.weight.device, dtype=child.weight.dtype)
+            setattr(module, name, lora)
             replaced += 1
         else:
             replaced += inject_lora(child, target_keywords, rank, alpha)
     return replaced
 
 
+def _load_manifest_pairs(
+    manifest_path: str,
+    subset_filter: set[str] | None,
+    split_filter: set[str] | None,
+) -> List[Tuple[str, str, str]]:
+    pairs: List[Tuple[str, str, str]] = []
+    with open(manifest_path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            subset = str(row.get("subset", "")).strip()
+            split = str(row.get("split", "")).strip()
+            mask_path = str(row.get("mask_path", "")).strip()
+            if subset_filter is not None and subset not in subset_filter:
+                continue
+            if split_filter is not None and split not in split_filter:
+                continue
+            if not mask_path:
+                continue
+
+            img_path = str(row.get("image_path", "")).strip()
+            if not img_path:
+                continue
+            pid = str(row.get("id", "")).strip() or Path(img_path).stem
+
+            img = Path(img_path if Path(img_path).is_absolute() else Path.cwd() / img_path)
+            msk = Path(mask_path if Path(mask_path).is_absolute() else Path.cwd() / mask_path)
+            if img.exists() and msk.exists():
+                pairs.append((pid, str(img), str(msk)))
+    if not pairs:
+        raise RuntimeError(f"No valid image/mask pairs loaded from manifest: {manifest_path}")
+    return pairs
+
+
 class MedSamTuneDataset(Dataset):
-    def __init__(self, image_dir: str, mask_dir: str, image_size: int = 1024):
+    def __init__(
+        self,
+        image_dir: str | None = None,
+        mask_dir: str | None = None,
+        image_size: int = 1024,
+        pairs: List[Tuple[str, str, str]] | None = None,
+        mask_threshold: int = 127,
+    ):
         self.image_size = image_size
-        image_dir = Path(image_dir)
-        mask_dir = Path(mask_dir)
-        image_map = {p.stem: p for p in image_dir.glob("*") if p.suffix.lower() in [".png", ".jpg", ".jpeg", ".bmp"]}
-        mask_map = {p.stem: p for p in mask_dir.glob("*") if p.suffix.lower() in [".png", ".jpg", ".jpeg", ".bmp"]}
-        self.keys = sorted(set(image_map.keys()) & set(mask_map.keys()))
-        self.image_map = image_map
-        self.mask_map = mask_map
-        if not self.keys:
-            raise ValueError("No overlapping image/mask pairs found for MedSAM fine-tuning.")
+        self.mask_threshold = int(mask_threshold)
+        self.items: List[Tuple[str, Path, Path]] = []
+
+        if pairs is not None:
+            self.items = [(pid, Path(img), Path(msk)) for pid, img, msk in pairs]
+        else:
+            if image_dir is None or mask_dir is None:
+                raise ValueError("image_dir/mask_dir are required when pairs is None")
+            image_dir_p = Path(image_dir)
+            mask_dir_p = Path(mask_dir)
+            image_map = {p.stem: p for p in image_dir_p.glob("*") if p.suffix.lower() in [".png", ".jpg", ".jpeg", ".bmp"]}
+            mask_map = {p.stem: p for p in mask_dir_p.glob("*") if p.suffix.lower() in [".png", ".jpg", ".jpeg", ".bmp"]}
+            keys = sorted(set(image_map.keys()) & set(mask_map.keys()))
+            self.items = [(k, image_map[k], mask_map[k]) for k in keys]
+
+        if not self.items:
+            raise ValueError("No image/mask pairs found for MedSAM fine-tuning.")
 
     def __len__(self):
-        return len(self.keys)
+        return len(self.items)
 
     def __getitem__(self, idx: int):
-        key = self.keys[idx]
-        image = cv2.imread(str(self.image_map[key]), cv2.IMREAD_COLOR)
+        key, image_path, mask_path = self.items[idx]
+        image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        mask = cv2.imread(str(self.mask_map[key]), cv2.IMREAD_GRAYSCALE)
-        mask = (mask > 127).astype(np.uint8)
+        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        mask = (mask > self.mask_threshold).astype(np.uint8)
 
         image = cv2.resize(image, (self.image_size, self.image_size), interpolation=cv2.INTER_LINEAR)
         mask = cv2.resize(mask, (self.image_size, self.image_size), interpolation=cv2.INTER_NEAREST)
@@ -92,7 +146,7 @@ class MedSamTuneDataset(Dataset):
                 dtype=np.float32,
             )
 
-        image_t = torch.from_numpy(image).permute(2, 0, 1).float()  # 0..255
+        image_t = torch.from_numpy(image).permute(2, 0, 1).float()
         mask_t = torch.from_numpy(mask).float().unsqueeze(0)
         box_t = torch.from_numpy(box).float()
         return {"image": image_t, "mask": mask_t, "box": box_t, "id": key}
@@ -107,12 +161,45 @@ def dice_loss_from_logits(logits: torch.Tensor, target: torch.Tensor, smooth: fl
     return 1.0 - dice.mean()
 
 
+def _safe_torch_load(path: str, map_location: str | torch.device | None = None):
+    # Prefer weights_only=True to avoid pickle execution and future warning noise.
+    try:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
+def _forward_lowres_logits_with_grad(sam: nn.Module, image_chw: torch.Tensor, box_xyxy: torch.Tensor) -> torch.Tensor:
+    # image_chw: [3,H,W] in [0,255], box_xyxy: [4]
+    input_image = sam.preprocess(image_chw)
+    image_embeddings = sam.image_encoder(input_image.unsqueeze(0))
+
+    sparse_embeddings, dense_embeddings = sam.prompt_encoder(
+        points=None,
+        boxes=box_xyxy.unsqueeze(0),
+        masks=None,
+    )
+    low_res_masks, _ = sam.mask_decoder(
+        image_embeddings=image_embeddings,
+        image_pe=sam.prompt_encoder.get_dense_pe(),
+        sparse_prompt_embeddings=sparse_embeddings,
+        dense_prompt_embeddings=dense_embeddings,
+        multimask_output=False,
+    )
+    return low_res_masks
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to medsam_vit_b.pth")
     parser.add_argument("--model-type", type=str, default="vit_b")
     parser.add_argument("--image-dir", type=str, default="data/processed_images/images")
     parser.add_argument("--mask-dir", type=str, default="data/processed_images/masks")
+    parser.add_argument("--data-manifest", type=str, default="")
+    parser.add_argument("--subset-filter", type=str, default="L_small")
+    parser.add_argument("--split-filter", type=str, default="train,val")
+    parser.add_argument("--mask-threshold", type=int, default=127)
+    parser.add_argument("--init-lora-checkpoint", type=str, default="")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -129,8 +216,12 @@ def main():
     set_seed(args.seed)
     os.makedirs(Path(args.save_path).parent, exist_ok=True)
 
-    sam = sam_model_registry[args.model_type](checkpoint=args.checkpoint).to(args.device)
-
+    sam = sam_model_registry[args.model_type](checkpoint=None).to(args.device)
+    base_state = _safe_torch_load(args.checkpoint, map_location=args.device)
+    if isinstance(base_state, dict) and "state_dict" in base_state and isinstance(base_state["state_dict"], dict):
+        base_state = base_state["state_dict"]
+    missing0, unexpected0 = sam.load_state_dict(base_state, strict=False)
+    print(f"[base checkpoint] missing={len(missing0)} unexpected={len(unexpected0)} from {args.checkpoint}")
     for p in sam.parameters():
         p.requires_grad = False
 
@@ -144,13 +235,34 @@ def main():
         for p in sam.mask_decoder.parameters():
             p.requires_grad = True
 
+    if args.init_lora_checkpoint:
+        ckpt = _safe_torch_load(args.init_lora_checkpoint, map_location=args.device)
+        state = ckpt.get("sam_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+        missing, unexpected = sam.load_state_dict(state, strict=False)
+        print(f"[resume] missing={len(missing)} unexpected={len(unexpected)} from {args.init_lora_checkpoint}")
+
     trainable = [p for p in sam.parameters() if p.requires_grad]
     if not trainable:
         raise RuntimeError("No trainable parameters found. Check LoRA injection keywords.")
-
     print(f"[LoRA] injected layers: {replaced}, trainable params: {sum(p.numel() for p in trainable)}")
 
-    dataset = MedSamTuneDataset(args.image_dir, args.mask_dir, image_size=args.image_size)
+    if args.data_manifest:
+        subsets = {s.strip() for s in args.subset_filter.split(",") if s.strip()} if args.subset_filter else None
+        splits = {s.strip() for s in args.split_filter.split(",") if s.strip()} if args.split_filter else None
+        pairs = _load_manifest_pairs(args.data_manifest, subset_filter=subsets, split_filter=splits)
+        dataset = MedSamTuneDataset(
+            image_size=args.image_size,
+            pairs=pairs,
+            mask_threshold=args.mask_threshold,
+        )
+    else:
+        dataset = MedSamTuneDataset(
+            image_dir=args.image_dir,
+            mask_dir=args.mask_dir,
+            image_size=args.image_size,
+            mask_threshold=args.mask_threshold,
+        )
+
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -168,7 +280,8 @@ def main():
         epoch_loss = 0.0
         pbar = tqdm(loader, desc=f"epoch {epoch}/{args.epochs}")
         for batch in pbar:
-            images = batch["image"].to(args.device) / 255.0
+            # SAM preprocess expects image values in [0,255], so keep raw scale here.
+            images = batch["image"].to(args.device)
             masks = batch["mask"].to(args.device)
             boxes = batch["box"].to(args.device)
             batch_size = images.size(0)
@@ -177,22 +290,11 @@ def main():
             loss_total = 0.0
 
             for i in range(batch_size):
-                outputs = sam(
-                    [
-                        {
-                            "image": images[i],
-                            "boxes": boxes[i].unsqueeze(0),
-                            "original_size": (args.image_size, args.image_size),
-                        }
-                    ],
-                    multimask_output=False,
-                )[0]
-
-                if "low_res_logits" in outputs:
-                    logits = outputs["low_res_logits"]  # 1,1,256,256
-                else:
-                    pred = outputs["masks"].float()
-                    logits = torch.logit(pred.clamp(1e-4, 1 - 1e-4))
+                logits = _forward_lowres_logits_with_grad(
+                    sam=sam,
+                    image_chw=images[i],
+                    box_xyxy=boxes[i],
+                )
 
                 target_low = F.interpolate(masks[i].unsqueeze(0), size=logits.shape[-2:], mode="nearest")
                 loss = bce(logits, target_low) + dice_loss_from_logits(logits, target_low)

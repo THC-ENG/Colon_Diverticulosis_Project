@@ -1,0 +1,62 @@
+﻿mode: supervised_only
+
+# Data protocol
+data_manifest: data/joint_polyp_v1/manifest/samples_v1.csv
+data_root: data/joint_polyp_v1
+manifest_mode: only
+mask_threshold: 127
+val_ratio: 0.2
+
+# Training
+epochs: 60
+batch_size: 4
+lr: 0.0001
+encoder_lr_mult: 0.1
+weight_decay: 0.0001
+warmup_epochs: 5
+grad_clip_norm: 1.0
+num_workers: 0
+img_size: 256
+seed: 42
+save_path: checkpoints/box_localizer_lsmall_best.pth
+init_checkpoint: ""
+run_name: box_localizer_lsmall
+
+# Runtime
+device: cuda
+amp: true
+norm_type: gn
+
+# Model architecture
+window_size: 8
+use_shift_mask: true
+use_rel_pos_bias: true
+pad_to_window: true
+use_wavelet_bottleneck: true
+deep_supervision: true
+ds_weight_d2: 0.4
+ds_weight_d3: 0.2
+ds_weight_d4: 0.1
+
+# Loss
+seg_focal_weight: 0.7
+seg_dice_weight: 0.3
+focal_alpha: 0.25
+focal_gamma: 2.0
+
+# keep disabled in supervised localizer
+use_edge_consistency: false
+use_distill: false
+lambda_sup: 1.0
+lambda_pseudo: 0.0
+lambda_edge: 0.0
+lambda_distill: 0.0
+schedule_milestones: 0.2,0.6,0.8
+
+# Legacy compatibility
+use_boundary: false
+use_boundary_head: false
+boundary_radius: 1
+boundary_weight: 0.3
+boundary_bce_weight: 1.0
+boundary_dice_weight: 0.0

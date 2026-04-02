@@ -1,0 +1,16 @@
+﻿# External evaluation config
+checkpoint: checkpoints/student_flywheel_best.pth
+data_manifest: data/joint_polyp_v1/manifest/samples_v1.csv
+data_root: data/joint_polyp_v1
+manifest_mode: prefer
+img_size: 256
+batch_size: 4
+num_workers: 2
+device: cuda
+save_dir: results/external_eval
+report_path: results/external_eval/report.json
+per_sample_report: results/external_eval/per_sample.json
+pred_threshold: 0.5
+threshold_search: false
+report_boundary_metrics: true
+boundary_radius: 1

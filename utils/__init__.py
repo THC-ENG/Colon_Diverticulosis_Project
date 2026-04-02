@@ -1,3 +1,3 @@
-from .dataset import ColonDataset
+from .dataset import ColonDataset, ProtocolSegDataset
 
-__all__ = ["ColonDataset"]
+__all__ = ["ColonDataset", "ProtocolSegDataset"]

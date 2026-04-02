@@ -11,7 +11,8 @@ from tqdm import tqdm
 
 from models.res_swin_unet import ResSwinUNet
 from utils.augmentations import ValAugmentor
-from utils.dataset import ColonDataset
+from utils.data_protocol import load_protocol_samples, summarize_samples, validate_protocol_samples
+from utils.dataset import ColonDataset, ProtocolSegDataset
 from utils.metrics import (
     boundary_f1_from_masks,
     dice_per_sample,
@@ -138,6 +139,49 @@ def _load_checkpoint(path: str, device: str):
         return torch.load(path, map_location=device)
 
 
+def _as_bool(value, default: bool) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        t = value.strip().lower()
+        if t in {"1", "true", "yes", "y", "on"}:
+            return True
+        if t in {"0", "false", "no", "n", "off"}:
+            return False
+    return bool(default)
+
+
+def _model_kwargs_from_checkpoint(ckpt: dict | object) -> dict:
+    if not isinstance(ckpt, dict):
+        return {}
+
+    model_kwargs = ckpt.get("model_kwargs", {})
+    if isinstance(model_kwargs, dict) and model_kwargs:
+        return dict(model_kwargs)
+
+    # Backward compatibility: older train checkpoints only save `args`.
+    args = ckpt.get("args", {})
+    if not isinstance(args, dict):
+        return {}
+
+    inferred = {
+        "num_classes": int(args.get("num_classes", 1)),
+        "use_boundary": _as_bool(args.get("use_boundary", False), False),
+        "norm_type": str(args.get("norm_type", "bn")),
+        "deep_supervision": _as_bool(args.get("deep_supervision", False), False),
+        "window_size": int(args.get("window_size", 8)),
+        "use_shift_mask": _as_bool(args.get("use_shift_mask", True), True),
+        "use_rel_pos_bias": _as_bool(args.get("use_rel_pos_bias", True), True),
+        "pad_to_window": _as_bool(args.get("pad_to_window", True), True),
+        "use_wavelet_bottleneck": _as_bool(args.get("use_wavelet_bottleneck", False), False),
+    }
+    return inferred
+
+
 def _boundary_from_seg_prob(seg_prob: torch.Tensor, threshold: float, radius: int) -> torch.Tensor:
     seg_np = (seg_prob.squeeze().cpu().numpy() > threshold).astype(np.uint8)
     boundary_np = mask_to_boundary(seg_np, radius=radius).astype(np.float32)
@@ -208,6 +252,47 @@ def _build_loader(image_dir: str, mask_dir: str, img_size: int, batch_size: int,
     return dataset, loader
 
 
+def _build_loader_from_protocol(
+    data_manifest: str,
+    data_root: str,
+    manifest_mode: str,
+    img_size: int,
+    batch_size: int,
+    num_workers: int,
+):
+    samples = load_protocol_samples(
+        data_manifest=data_manifest or None,
+        data_root=data_root or None,
+        manifest_mode=manifest_mode,
+    )
+    validate_protocol_samples(samples)
+    print(f"[eval protocol] {json.dumps(summarize_samples(samples), ensure_ascii=False)}")
+
+    test_rows = [
+        s
+        for s in samples
+        if (s.subset == "external" and s.split in {"test", ""})
+    ]
+    if not test_rows:
+        test_rows = [s for s in samples if s.split == "test" and s.mask_path]
+    if not test_rows:
+        raise RuntimeError("No test rows found in protocol manifest.")
+
+    dataset = ProtocolSegDataset(
+        test_rows,
+        transform=ValAugmentor((img_size, img_size)),
+        use_boundary=False,
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+    return dataset, loader
+
+
 def _search_best_threshold(model, loader, device: str, thresholds: list[float]) -> float:
     scores = {th: [] for th in thresholds}
 
@@ -228,6 +313,14 @@ def _search_best_threshold(model, loader, device: str, thresholds: list[float]) 
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--data-manifest", type=str, default="")
+    parser.add_argument("--data-root", type=str, default="")
+    parser.add_argument(
+        "--manifest-mode",
+        type=str,
+        default="prefer",
+        choices=["prefer", "only", "off"],
+    )
     parser.add_argument("--image-dir", type=str, default="data/processed_images/images/test")
     parser.add_argument("--mask-dir", type=str, default="data/processed_images/masks/test")
     parser.add_argument("--val-image-dir", type=str, default="")
@@ -260,24 +353,34 @@ def main():
     if args.save_boundary:
         os.makedirs(args.boundary_dir, exist_ok=True)
 
-    test_dataset, test_loader = _build_loader(
-        image_dir=args.image_dir,
-        mask_dir=args.mask_dir,
-        img_size=args.img_size,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-    )
+    use_protocol = bool(args.data_manifest or args.data_root) and args.manifest_mode != "off"
+    if use_protocol:
+        test_dataset, test_loader = _build_loader_from_protocol(
+            data_manifest=args.data_manifest,
+            data_root=args.data_root,
+            manifest_mode=args.manifest_mode,
+            img_size=args.img_size,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+        )
+    else:
+        test_dataset, test_loader = _build_loader(
+            image_dir=args.image_dir,
+            mask_dir=args.mask_dir,
+            img_size=args.img_size,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+        )
 
     ckpt = _load_checkpoint(args.checkpoint, args.device)
     ckpt_use_boundary = bool(ckpt.get("use_boundary", False)) if isinstance(ckpt, dict) else False
-    model_kwargs = ckpt.get("model_kwargs", {}) if isinstance(ckpt, dict) else {}
-    if not isinstance(model_kwargs, dict):
-        model_kwargs = {}
+    model_kwargs = _model_kwargs_from_checkpoint(ckpt)
 
     effective_use_boundary = args.use_boundary or ckpt_use_boundary or bool(model_kwargs.get("use_boundary", False))
     model_kwargs = dict(model_kwargs)
     model_kwargs["num_classes"] = int(model_kwargs.get("num_classes", 1))
     model_kwargs["use_boundary"] = effective_use_boundary
+    print(f"[eval model kwargs] {json.dumps(model_kwargs, ensure_ascii=False)}")
 
     model = ResSwinUNet(**model_kwargs).to(args.device)
     state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
@@ -312,12 +415,20 @@ def main():
     boundary_f1_values = []
     hd95_values = []
     sample_rows = []
+    grouped = {}
 
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Inference"):
             images = batch["image"].to(args.device)
             masks = batch["mask"].to(args.device)
             ids = batch["id"]
+            sources = batch.get("source", [""] * len(ids))
+            subsets = batch.get("subset", [""] * len(ids))
+            round_ids = batch.get("round_id", None)
+            if torch.is_tensor(round_ids):
+                round_ids = [int(v) for v in round_ids.detach().cpu().tolist()]
+            elif round_ids is None:
+                round_ids = [0] * len(ids)
 
             parsed = _parse_model_outputs(model(images))
             seg_logits = parsed["seg"]
@@ -354,6 +465,9 @@ def main():
                     "id": sample_id,
                     "dice": float(d[j].item()),
                     "iou": float(i[j].item()),
+                    "source": str(sources[j]) if j < len(sources) else "",
+                    "subset": str(subsets[j]) if j < len(subsets) else "",
+                    "round_id": int(round_ids[j]) if j < len(round_ids) else 0,
                 }
 
                 if args.report_boundary_metrics:
@@ -368,6 +482,16 @@ def main():
                 entropy = -(prob * torch.log(prob) + (1.0 - prob) * torch.log(1.0 - prob)).mean()
                 row["uncertainty_entropy"] = float(entropy.item())
                 sample_rows.append(row)
+
+                gk = f"{row['source']}|{row['subset']}|r{row['round_id']}"
+                if gk not in grouped:
+                    grouped[gk] = {"dice": [], "iou": [], "boundary_f1": [], "hd95": []}
+                grouped[gk]["dice"].append(row["dice"])
+                grouped[gk]["iou"].append(row["iou"])
+                if "boundary_f1" in row:
+                    grouped[gk]["boundary_f1"].append(row["boundary_f1"])
+                if "hd95" in row:
+                    grouped[gk]["hd95"].append(row["hd95"])
 
                 if args.save_boundary:
                     save_boundary_probability_heatmap(
@@ -391,6 +515,18 @@ def main():
         report["boundary_f1_std"] = float(np.std(boundary_f1_values)) if boundary_f1_values else 0.0
         report["hd95_mean"] = float(np.mean(hd95_values)) if hd95_values else 0.0
         report["hd95_std"] = float(np.std(hd95_values)) if hd95_values else 0.0
+
+    grouped_report = {}
+    for key, vals in grouped.items():
+        grouped_report[key] = {
+            "n": len(vals["dice"]),
+            "dice_mean": float(np.mean(vals["dice"])) if vals["dice"] else 0.0,
+            "iou_mean": float(np.mean(vals["iou"])) if vals["iou"] else 0.0,
+            "boundary_f1_mean": float(np.mean(vals["boundary_f1"])) if vals["boundary_f1"] else 0.0,
+            "hd95_mean": float(np.mean(vals["hd95"])) if vals["hd95"] else 0.0,
+        }
+    if grouped_report:
+        report["grouped_metrics"] = grouped_report
 
     with open(args.report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)

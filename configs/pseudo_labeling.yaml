@@ -1,0 +1,17 @@
+﻿# Pseudo labeling config
+checkpoint: checkpoints/medsam_vit_b.pth
+model_type: vit_b
+lora_checkpoint: checkpoints/teacher_r0.pth
+data_manifest: data/joint_polyp_v1/manifest/samples_v1.csv
+subset_filter: U_large
+id_filter: ""
+proposal_json: ""
+fallback_full_image: true
+round_id: 1
+output_root: runs/flywheel/round1/pseudo
+device: cuda
+skip_exist: true
+
+# Filtering
+keep_quantile: 0.35
+quality_score: 0.6*conf+0.4*edge_quality

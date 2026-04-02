@@ -1,0 +1,19 @@
+﻿# Teacher LoRA adaptation config
+checkpoint: checkpoints/medsam_vit_b.pth
+model_type: vit_b
+data_manifest: data/joint_polyp_v1/manifest/samples_v1.csv
+subset_filter: L_small
+split_filter: train,val
+mask_threshold: 127
+
+epochs: 10
+batch_size: 1
+lr: 0.0001
+rank: 8
+alpha: 16
+image_size: 1024
+num_workers: 2
+seed: 42
+device: cuda
+save_path: checkpoints/teacher_r0.pth
+train_mask_decoder: false

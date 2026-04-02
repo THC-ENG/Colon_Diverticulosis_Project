@@ -29,3 +29,13 @@ python tools/select_hard_examples.py --per-sample-report results/per_sample_repo
 ```bash
 python tools/aggregate_metrics.py --group baseline=results/ablation/baseline_seed*.json --group swin_fix=results/ablation/swin_fix_seed*.json --metric dice_mean --compare-to baseline --output results/ablation_summary.json
 ```
+
+## 7) Full Flywheel (Teacher -> Round1 -> Refresh -> Round2 -> Student)
+```bash
+python tools/run_full_flywheel.py --data-manifest data/joint_polyp_v1/manifest/samples_v1.csv --base-sam-checkpoint checkpoints/medsam_vit_b.pth --student-config configs/student_joint_training.yaml
+```
+
+## 8) Pseudo label filtering (quantile)
+```bash
+python tools/filter_pseudo_labels.py --quality-csv runs/flywheel/round1/pseudo/pseudo_quality.csv --keep-quantile 0.35 --quality-score "0.6*conf+0.4*edge_quality" --output-dir runs/flywheel/round1/filter --pseudo-candidates-manifest runs/flywheel/round1/pseudo/pseudo_candidates_manifest.csv --base-manifest data/joint_polyp_v1/manifest/samples_v1.csv
+```
