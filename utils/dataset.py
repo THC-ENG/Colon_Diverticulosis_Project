@@ -79,7 +79,10 @@ class ColonDataset(Dataset):
             raise ValueError(f"Cannot read mask: {mask_path}")
 
         if self.transform is not None:
-            image, mask = self.transform(image, mask)
+            try:
+                image, mask = self.transform(image, mask, source="")
+            except TypeError:
+                image, mask = self.transform(image, mask)
 
         mask_bin = (mask > 0).astype(np.uint8)
 
@@ -157,7 +160,10 @@ class ProtocolSegDataset(Dataset):
             mask = np.zeros(image.shape[:2], dtype=np.uint8)
 
         if self.transform is not None:
-            image, mask = self.transform(image, mask)
+            try:
+                image, mask = self.transform(image, mask, source=row.source)
+            except TypeError:
+                image, mask = self.transform(image, mask)
 
         mask_bin = (mask > self.mask_threshold).astype(np.uint8)
         h, w = mask_bin.shape
@@ -196,6 +202,7 @@ class ProtocolSegDataset(Dataset):
             "pseudo_weight": torch.tensor(float(row.pseudo_weight), dtype=torch.float32),
             "round_id": torch.tensor(int(row.round_id), dtype=torch.int64),
             "exclude_from_tuning": torch.tensor(float(row.exclude_from_tuning), dtype=torch.float32),
+            "tier": row.tier,
             "distill_soft": torch.from_numpy(distill_soft).unsqueeze(0),
             "distill_edge": torch.from_numpy(distill_edge).unsqueeze(0),
             "has_distill_soft": torch.tensor(float(has_distill_soft), dtype=torch.float32),

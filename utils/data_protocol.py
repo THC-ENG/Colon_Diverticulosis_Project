@@ -26,6 +26,7 @@ class ProtocolSample:
     exclude_from_tuning: int = 0
     soft_path: str = ""
     edge_path: str = ""
+    tier: str = ""
 
     def to_row(self) -> dict:
         return asdict(self)
@@ -134,6 +135,7 @@ def load_manifest_samples(manifest_path: str) -> list[ProtocolSample]:
                 exclude_from_tuning=_to_int(raw.get("exclude_from_tuning"), default=0),
                 soft_path=_resolve_path(raw.get("soft_path", ""), path),
                 edge_path=_resolve_path(raw.get("edge_path", ""), path),
+                tier=str(raw.get("tier", "")).strip(),
             )
             if sample.id == "":
                 sample.id = Path(sample.image_path).stem
@@ -345,6 +347,7 @@ def write_manifest(samples: Iterable[ProtocolSample], output_path: str) -> None:
         "exclude_from_tuning",
         "soft_path",
         "edge_path",
+        "tier",
     ]
     with open(path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -365,4 +368,3 @@ def summarize_samples(samples: Iterable[ProtocolSample]) -> dict:
         "by_subset": by_subset,
         "by_split": by_split,
     }
-

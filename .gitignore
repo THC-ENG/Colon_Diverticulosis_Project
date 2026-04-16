@@ -80,3 +80,5 @@ pytest_cache/
 *.bak
 *.swp
 *.tmp
+# Local helper deps for plotting scripts
+.deps/

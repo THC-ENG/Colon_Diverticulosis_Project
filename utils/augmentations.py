@@ -12,6 +12,42 @@ def _resize_pair(image: np.ndarray, mask: np.ndarray, size: Tuple[int, int]) -> 
     return image, mask
 
 
+def _is_polypgen_source(source: str) -> bool:
+    return "polypgen" in str(source or "").strip().lower()
+
+
+def _apply_polypgen_color_domain_augment(
+    image: np.ndarray,
+    h_shift_max: int = 12,
+    sat_scale_range: Tuple[float, float] = (0.70, 1.40),
+    val_scale_range: Tuple[float, float] = (0.75, 1.30),
+    gamma_range: Tuple[float, float] = (0.75, 1.35),
+    clahe_prob: float = 0.60,
+) -> np.ndarray:
+    out = image.copy()
+
+    hsv = cv2.cvtColor(out, cv2.COLOR_RGB2HSV).astype(np.float32)
+    hue_shift = random.randint(-max(0, int(h_shift_max)), max(0, int(h_shift_max)))
+    sat_scale = random.uniform(float(sat_scale_range[0]), float(sat_scale_range[1]))
+    val_scale = random.uniform(float(val_scale_range[0]), float(val_scale_range[1]))
+    hsv[..., 0] = np.mod(hsv[..., 0] + hue_shift, 180.0)
+    hsv[..., 1] = np.clip(hsv[..., 1] * sat_scale, 0.0, 255.0)
+    hsv[..., 2] = np.clip(hsv[..., 2] * val_scale, 0.0, 255.0)
+    out = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+
+    gamma = random.uniform(float(gamma_range[0]), float(gamma_range[1]))
+    gamma = max(1e-6, gamma)
+    table = np.array([((i / 255.0) ** (1.0 / gamma)) * 255.0 for i in range(256)], dtype=np.float32)
+    out = cv2.LUT(out, table.astype(np.uint8))
+
+    if random.random() < float(max(0.0, min(1.0, clahe_prob))):
+        lab = cv2.cvtColor(out, cv2.COLOR_RGB2LAB)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        lab[..., 0] = clahe.apply(lab[..., 0])
+        out = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+    return out
+
+
 class TrainAugmentor:
     def __init__(
         self,
@@ -21,6 +57,12 @@ class TrainAugmentor:
         distortion_prob: float = 0.2,
         blur_prob: float = 0.2,
         mask_morph_prob: float = 0.08,
+        polypgen_aug_prob: float = 0.7,
+        polypgen_h_shift_max: int = 12,
+        polypgen_sat_scale_range: Tuple[float, float] = (0.70, 1.40),
+        polypgen_val_scale_range: Tuple[float, float] = (0.75, 1.30),
+        polypgen_gamma_range: Tuple[float, float] = (0.75, 1.35),
+        polypgen_clahe_prob: float = 0.60,
     ):
         self.out_size = out_size
         self.lesion_crop_prob = lesion_crop_prob
@@ -28,6 +70,12 @@ class TrainAugmentor:
         self.distortion_prob = distortion_prob
         self.blur_prob = blur_prob
         self.mask_morph_prob = mask_morph_prob
+        self.polypgen_aug_prob = polypgen_aug_prob
+        self.polypgen_h_shift_max = polypgen_h_shift_max
+        self.polypgen_sat_scale_range = polypgen_sat_scale_range
+        self.polypgen_val_scale_range = polypgen_val_scale_range
+        self.polypgen_gamma_range = polypgen_gamma_range
+        self.polypgen_clahe_prob = polypgen_clahe_prob
 
     def _crop_near_lesion(self, image: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         h, w = mask.shape
@@ -127,7 +175,7 @@ class TrainAugmentor:
         )
         return image, mask
 
-    def __call__(self, image: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def __call__(self, image: np.ndarray, mask: np.ndarray, source: str = "") -> Tuple[np.ndarray, np.ndarray]:
         image, mask = self._crop_near_lesion(image, mask)
 
         if random.random() < 0.5:
@@ -153,6 +201,16 @@ class TrainAugmentor:
         alpha = random.uniform(0.9, 1.1)
         beta = random.uniform(-12.0, 12.0)
         image = cv2.convertScaleAbs(image, alpha=alpha, beta=beta)
+
+        if _is_polypgen_source(source) and random.random() < float(max(0.0, min(1.0, self.polypgen_aug_prob))):
+            image = _apply_polypgen_color_domain_augment(
+                image,
+                h_shift_max=self.polypgen_h_shift_max,
+                sat_scale_range=self.polypgen_sat_scale_range,
+                val_scale_range=self.polypgen_val_scale_range,
+                gamma_range=self.polypgen_gamma_range,
+                clahe_prob=self.polypgen_clahe_prob,
+            )
 
         if random.random() < self.mask_morph_prob and (mask > 0).any():
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
@@ -180,13 +238,25 @@ class DistillTrainAugmentor:
         hflip_prob: float = 0.5,
         vflip_prob: float = 0.2,
         blur_prob: float = 0.15,
+        polypgen_aug_prob: float = 0.7,
+        polypgen_h_shift_max: int = 12,
+        polypgen_sat_scale_range: Tuple[float, float] = (0.70, 1.40),
+        polypgen_val_scale_range: Tuple[float, float] = (0.75, 1.30),
+        polypgen_gamma_range: Tuple[float, float] = (0.75, 1.35),
+        polypgen_clahe_prob: float = 0.60,
     ):
         self.out_size = out_size
         self.hflip_prob = hflip_prob
         self.vflip_prob = vflip_prob
         self.blur_prob = blur_prob
+        self.polypgen_aug_prob = polypgen_aug_prob
+        self.polypgen_h_shift_max = polypgen_h_shift_max
+        self.polypgen_sat_scale_range = polypgen_sat_scale_range
+        self.polypgen_val_scale_range = polypgen_val_scale_range
+        self.polypgen_gamma_range = polypgen_gamma_range
+        self.polypgen_clahe_prob = polypgen_clahe_prob
 
-    def __call__(self, image: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def __call__(self, image: np.ndarray, mask: np.ndarray, source: str = "") -> Tuple[np.ndarray, np.ndarray]:
         if random.random() < self.hflip_prob:
             image = cv2.flip(image, 1)
             mask = cv2.flip(mask, 1)
@@ -197,6 +267,16 @@ class DistillTrainAugmentor:
         alpha = random.uniform(0.92, 1.08)
         beta = random.uniform(-10.0, 10.0)
         image = cv2.convertScaleAbs(image, alpha=alpha, beta=beta)
+
+        if _is_polypgen_source(source) and random.random() < float(max(0.0, min(1.0, self.polypgen_aug_prob))):
+            image = _apply_polypgen_color_domain_augment(
+                image,
+                h_shift_max=self.polypgen_h_shift_max,
+                sat_scale_range=self.polypgen_sat_scale_range,
+                val_scale_range=self.polypgen_val_scale_range,
+                gamma_range=self.polypgen_gamma_range,
+                clahe_prob=self.polypgen_clahe_prob,
+            )
 
         if random.random() < self.blur_prob:
             image = cv2.GaussianBlur(image, (3, 3), sigmaX=0)

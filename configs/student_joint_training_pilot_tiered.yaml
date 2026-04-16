@@ -1,0 +1,85 @@
+﻿mode: student_with_pseudo_distill
+
+# Data protocol
+data_manifest: runs/flywheel/student_manifest_tiered_pilot.csv
+data_root: data/joint_polyp_v1
+manifest_mode: only
+mask_threshold: 127
+val_ratio: 0.2
+train_pseudo_max_ratio: 0.25
+train_pseudo_max_count: 0
+
+# Domain-aware sampling
+use_domain_aware_sampler: true
+source_balance_power: 0.5
+polypgen_source_boost: 1.6
+labeled_sample_factor: 1.0
+pseudo_sample_factor: 0.7
+tier_mid_sample_factor: 0.6
+tier_high_sample_factor: 1.0
+
+# Training
+epochs: 25
+batch_size: 4
+lr: 0.0001
+encoder_lr_mult: 0.1
+weight_decay: 0.0001
+warmup_epochs: 3
+grad_clip_norm: 1.0
+num_workers: 2
+img_size: 256
+seed: 42
+save_path: checkpoints/student_flywheel_tiered_pilot_best.pth
+init_checkpoint: ""
+run_name: student_flywheel_tiered_pilot
+
+# Runtime
+device: cuda
+amp: true
+norm_type: gn
+
+# Model architecture
+window_size: 8
+use_shift_mask: true
+use_rel_pos_bias: true
+pad_to_window: true
+use_wavelet_bottleneck: true
+deep_supervision: true
+ds_weight_d2: 0.4
+ds_weight_d3: 0.2
+ds_weight_d4: 0.1
+
+# Loss design
+seg_focal_weight: 0.7
+seg_dice_weight: 0.3
+focal_alpha: 0.25
+focal_gamma: 2.0
+
+use_edge_consistency: true
+use_distill: true
+distill_signals: softmask,edge
+distill_temperature: 2.0
+lambda_sup: 1.0
+lambda_pseudo: 0.10
+lambda_edge: 0.08
+lambda_distill: 0.0
+schedule_milestones: 0.3,0.8,0.95
+
+# PolypGen domain augmentation
+polypgen_aug_prob: 0.7
+polypgen_h_shift_max: 12
+polypgen_sat_scale_min: 0.70
+polypgen_sat_scale_max: 1.40
+polypgen_val_scale_min: 0.75
+polypgen_val_scale_max: 1.30
+polypgen_gamma_min: 0.75
+polypgen_gamma_max: 1.35
+polypgen_clahe_prob: 0.60
+
+# Keep boundary head off in this phase
+use_boundary: false
+use_boundary_head: false
+boundary_radius: 1
+boundary_weight: 0.3
+boundary_bce_weight: 1.0
+boundary_dice_weight: 0.0

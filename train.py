@@ -6,11 +6,12 @@ import random
 import shlex
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -70,6 +71,13 @@ def _build_parser():
     p.add_argument("--val-ratio", type=float, default=cfg.get("val_ratio", 0.2))
     p.add_argument("--train-pseudo-max-ratio", type=float, default=cfg.get("train_pseudo_max_ratio", -1.0))
     p.add_argument("--train-pseudo-max-count", type=int, default=cfg.get("train_pseudo_max_count", 0))
+    p.add_argument("--use-domain-aware-sampler", action=argparse.BooleanOptionalAction, default=cfg.get("use_domain_aware_sampler", False))
+    p.add_argument("--source-balance-power", type=float, default=cfg.get("source_balance_power", 0.5))
+    p.add_argument("--polypgen-source-boost", type=float, default=cfg.get("polypgen_source_boost", 1.6))
+    p.add_argument("--labeled-sample-factor", type=float, default=cfg.get("labeled_sample_factor", 1.0))
+    p.add_argument("--pseudo-sample-factor", type=float, default=cfg.get("pseudo_sample_factor", 0.7))
+    p.add_argument("--tier-mid-sample-factor", type=float, default=cfg.get("tier_mid_sample_factor", 0.6))
+    p.add_argument("--tier-high-sample-factor", type=float, default=cfg.get("tier_high_sample_factor", 1.0))
 
     p.add_argument("--dataset-root", type=str, default=cfg.get("dataset_root", ""))
     p.add_argument("--train-image-dir", type=str, default=cfg.get("train_image_dir", "data/processed_images/images/train"))
@@ -96,6 +104,15 @@ def _build_parser():
     p.add_argument("--save-path", type=str, default=cfg.get("save_path", "checkpoints/best_model.pth"))
     p.add_argument("--init-checkpoint", type=str, default=cfg.get("init_checkpoint", ""))
     p.add_argument("--run-name", type=str, default=cfg.get("run_name", ""))
+    p.add_argument("--polypgen-aug-prob", type=float, default=cfg.get("polypgen_aug_prob", 0.7))
+    p.add_argument("--polypgen-h-shift-max", type=int, default=cfg.get("polypgen_h_shift_max", 12))
+    p.add_argument("--polypgen-sat-scale-min", type=float, default=cfg.get("polypgen_sat_scale_min", 0.70))
+    p.add_argument("--polypgen-sat-scale-max", type=float, default=cfg.get("polypgen_sat_scale_max", 1.40))
+    p.add_argument("--polypgen-val-scale-min", type=float, default=cfg.get("polypgen_val_scale_min", 0.75))
+    p.add_argument("--polypgen-val-scale-max", type=float, default=cfg.get("polypgen_val_scale_max", 1.30))
+    p.add_argument("--polypgen-gamma-min", type=float, default=cfg.get("polypgen_gamma_min", 0.75))
+    p.add_argument("--polypgen-gamma-max", type=float, default=cfg.get("polypgen_gamma_max", 1.35))
+    p.add_argument("--polypgen-clahe-prob", type=float, default=cfg.get("polypgen_clahe_prob", 0.60))
 
     p.add_argument("--norm-type", type=str, default=cfg.get("norm_type", "gn"), choices=["bn", "gn"])
     p.add_argument("--deep-supervision", action=argparse.BooleanOptionalAction, default=cfg.get("deep_supervision", True))
@@ -195,6 +212,68 @@ def _resolve_fold_split(args):
     return image_dir, mask_dir, train_ids, val_ids
 
 
+def _is_polypgen_source(text: str) -> bool:
+    return "polypgen" in str(text or "").strip().lower()
+
+
+def _build_protocol_sampler(train_rows, args):
+    if not bool(args.use_domain_aware_sampler):
+        return None, {}
+    if not train_rows:
+        return None, {}
+
+    source_key = [str(s.source).strip() or "unknown" for s in train_rows]
+    source_counter = Counter(source_key)
+    sp = float(max(0.0, args.source_balance_power))
+    pg_boost = float(max(0.0, args.polypgen_source_boost))
+    labeled_factor = float(max(0.0, args.labeled_sample_factor))
+    pseudo_factor = float(max(0.0, args.pseudo_sample_factor))
+    tier_mid = float(max(0.0, args.tier_mid_sample_factor))
+    tier_high = float(max(0.0, args.tier_high_sample_factor))
+
+    weights = []
+    for s, src in zip(train_rows, source_key):
+        inv = 1.0 / float(max(1, source_counter[src]))
+        source_factor = inv ** sp
+        if _is_polypgen_source(src):
+            source_factor *= pg_boost
+
+        label_factor = pseudo_factor if int(s.is_pseudo) == 1 else labeled_factor
+        if int(s.is_pseudo) == 1:
+            tier = str(getattr(s, "tier", "") or "").strip().lower()
+            if tier == "mid":
+                tier_factor = tier_mid
+            elif tier == "low":
+                tier_factor = 0.0
+            else:
+                tier_factor = tier_high
+        else:
+            tier_factor = 1.0
+        weights.append(float(max(0.0, source_factor * label_factor * tier_factor)))
+
+    if not any(w > 0.0 for w in weights):
+        return None, {
+            "enabled": True,
+            "fallback_reason": "all_weights_zero",
+        }
+
+    sampler = WeightedRandomSampler(
+        weights=torch.as_tensor(weights, dtype=torch.double),
+        num_samples=len(weights),
+        replacement=True,
+    )
+    stats = {
+        "enabled": True,
+        "num_rows": len(train_rows),
+        "num_sources": len(source_counter),
+        "source_counts": dict(source_counter),
+        "weight_min": float(min(weights)),
+        "weight_max": float(max(weights)),
+        "weight_mean": float(sum(weights) / float(max(1, len(weights)))),
+    }
+    return sampler, stats
+
+
 def _build_data(args):
     use_protocol = bool(args.data_manifest or args.data_root) and args.manifest_mode != "off"
     if use_protocol:
@@ -209,10 +288,29 @@ def _build_data(args):
             pseudo_max_ratio=args.train_pseudo_max_ratio,
             pseudo_max_count=args.train_pseudo_max_count,
         )
+        sat_range = (float(args.polypgen_sat_scale_min), float(args.polypgen_sat_scale_max))
+        val_range = (float(args.polypgen_val_scale_min), float(args.polypgen_val_scale_max))
+        gamma_range = (float(args.polypgen_gamma_min), float(args.polypgen_gamma_max))
         if args.mode == "student_with_pseudo_distill" and args.use_distill:
-            train_tf = DistillTrainAugmentor((args.img_size, args.img_size))
+            train_tf = DistillTrainAugmentor(
+                (args.img_size, args.img_size),
+                polypgen_aug_prob=float(args.polypgen_aug_prob),
+                polypgen_h_shift_max=int(args.polypgen_h_shift_max),
+                polypgen_sat_scale_range=sat_range,
+                polypgen_val_scale_range=val_range,
+                polypgen_gamma_range=gamma_range,
+                polypgen_clahe_prob=float(args.polypgen_clahe_prob),
+            )
         else:
-            train_tf = TrainAugmentor((args.img_size, args.img_size))
+            train_tf = TrainAugmentor(
+                (args.img_size, args.img_size),
+                polypgen_aug_prob=float(args.polypgen_aug_prob),
+                polypgen_h_shift_max=int(args.polypgen_h_shift_max),
+                polypgen_sat_scale_range=sat_range,
+                polypgen_val_scale_range=val_range,
+                polypgen_gamma_range=gamma_range,
+                polypgen_clahe_prob=float(args.polypgen_clahe_prob),
+            )
         val_tf = ValAugmentor((args.img_size, args.img_size))
         n_lsmall = sum(1 for s in train_rows if s.subset == "L_small" and s.is_pseudo == 0)
         n_pseudo = sum(1 for s in train_rows if s.is_pseudo == 1)
@@ -224,7 +322,8 @@ def _build_data(args):
         )
         train_ds = ProtocolSegDataset(train_rows, transform=train_tf, mask_threshold=args.mask_threshold)
         val_ds = ProtocolSegDataset(val_rows, transform=val_tf, mask_threshold=args.mask_threshold)
-        return use_protocol, train_ds, val_ds
+        train_sampler, sampler_stats = _build_protocol_sampler(train_rows, args)
+        return use_protocol, train_ds, val_ds, train_sampler, sampler_stats
 
     fold_img, fold_msk, train_ids, val_ids = _resolve_fold_split(args)
     if fold_img is not None:
@@ -242,7 +341,15 @@ def _build_data(args):
     train_ds = ColonDataset(
         tr_img,
         tr_msk,
-        transform=TrainAugmentor((args.img_size, args.img_size)),
+        transform=TrainAugmentor(
+            (args.img_size, args.img_size),
+            polypgen_aug_prob=float(args.polypgen_aug_prob),
+            polypgen_h_shift_max=int(args.polypgen_h_shift_max),
+            polypgen_sat_scale_range=(float(args.polypgen_sat_scale_min), float(args.polypgen_sat_scale_max)),
+            polypgen_val_scale_range=(float(args.polypgen_val_scale_min), float(args.polypgen_val_scale_max)),
+            polypgen_gamma_range=(float(args.polypgen_gamma_min), float(args.polypgen_gamma_max)),
+            polypgen_clahe_prob=float(args.polypgen_clahe_prob),
+        ),
         use_boundary=args.use_boundary,
         boundary_radius=args.boundary_radius,
         include_ids=train_ids,
@@ -255,7 +362,7 @@ def _build_data(args):
         boundary_radius=args.boundary_radius,
         include_ids=val_ids,
     )
-    return use_protocol, train_ds, val_ds
+    return use_protocol, train_ds, val_ds, None, {}
 
 
 def _run_epoch(model, loader, criterion, aux_criterion, optimizer, scaler, args, train: bool, epoch_idx: int):
@@ -390,8 +497,15 @@ def main():
     writer_dir = str(Path("runs") / (args.run_name if args.run_name else args.mode))
     os.makedirs(writer_dir, exist_ok=True)
 
-    use_protocol, train_ds, val_ds = _build_data(args)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
+    use_protocol, train_ds, val_ds, train_sampler, sampler_stats = _build_data(args)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
 
     model = ResSwinUNet(
@@ -460,6 +574,8 @@ def main():
 
     best = -1.0
     print(f"[mode] {args.mode} | [protocol] {use_protocol} | train={len(train_ds)} val={len(val_ds)}")
+    if sampler_stats:
+        print(f"[domain sampler] {json.dumps(sampler_stats, ensure_ascii=False)}")
     for epoch in range(1, args.epochs + 1):
         tr = _run_epoch(model, train_loader, criterion, aux_criterion, opt, scaler, args, True, epoch - 1)
         va = _run_epoch(model, val_loader, criterion, aux_criterion, opt, scaler, args, False, epoch - 1)
