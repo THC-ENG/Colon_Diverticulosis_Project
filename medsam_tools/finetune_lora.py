@@ -2,6 +2,7 @@ import argparse
 import csv
 import os
 import random
+import re
 from pathlib import Path
 from typing import List, Tuple
 
@@ -43,17 +44,136 @@ class LoRALinear(nn.Module):
         return base_out + self.scale * delta
 
 
-def inject_lora(module: nn.Module, target_keywords: List[str], rank: int, alpha: int) -> int:
+def _match_any(text: str, keywords: List[str]) -> bool:
+    t = str(text).strip().lower()
+    return any(str(k).strip().lower() in t for k in keywords if str(k).strip())
+
+
+def inject_lora(
+    module: nn.Module,
+    target_keywords: List[str],
+    rank: int,
+    alpha: int,
+    prefix: str = "",
+    exclude_keywords: List[str] | None = None,
+) -> int:
     replaced = 0
+    excludes = exclude_keywords or []
     for name, child in list(module.named_children()):
-        if isinstance(child, nn.Linear) and any(k in name.lower() for k in target_keywords):
+        full_name = f"{prefix}.{name}" if prefix else name
+        full_name_l = full_name.lower()
+        if (
+            isinstance(child, nn.Linear)
+            and _match_any(full_name_l, target_keywords)
+            and not _match_any(full_name_l, excludes)
+        ):
             lora = LoRALinear(child, rank=rank, alpha=alpha)
             lora = lora.to(device=child.weight.device, dtype=child.weight.dtype)
             setattr(module, name, lora)
             replaced += 1
         else:
-            replaced += inject_lora(child, target_keywords, rank, alpha)
+            replaced += inject_lora(
+                child,
+                target_keywords=target_keywords,
+                rank=rank,
+                alpha=alpha,
+                prefix=full_name,
+                exclude_keywords=excludes,
+            )
     return replaced
+
+
+def _encoder_block_index(param_name: str) -> int:
+    m = re.search(r"image_encoder\.blocks\.(\d+)\.", str(param_name))
+    if not m:
+        return -1
+    try:
+        return int(m.group(1))
+    except Exception:
+        return -1
+
+
+def _collect_encoder_blocks(sam: nn.Module) -> int:
+    mx = -1
+    for n, _ in sam.named_parameters():
+        b = _encoder_block_index(n)
+        if b > mx:
+            mx = b
+    return int(mx + 1) if mx >= 0 else 0
+
+
+def _set_stage_trainable(
+    sam: nn.Module,
+    stage_idx: int,
+    encoder_tail_start_block: int,
+    train_mask_decoder_full: bool,
+) -> tuple[int, int]:
+    total = 0
+    enabled = 0
+    for name, p in sam.named_parameters():
+        lname = str(name).lower()
+        is_lora = ".lora_a" in lname or ".lora_b" in lname
+        keep = False
+        if is_lora:
+            total += int(p.numel())
+            if lname.startswith("mask_decoder."):
+                keep = True
+            elif lname.startswith("image_encoder."):
+                if int(stage_idx) >= 3:
+                    keep = True
+                elif int(stage_idx) == 2:
+                    block_idx = _encoder_block_index(lname)
+                    keep = block_idx >= int(encoder_tail_start_block) and block_idx >= 0
+                else:
+                    keep = False
+        elif train_mask_decoder_full and lname.startswith("mask_decoder."):
+            keep = True
+            total += int(p.numel())
+        p.requires_grad = bool(keep)
+        if keep:
+            enabled += int(p.numel())
+    return enabled, total
+
+
+def _parse_stage_epochs(text: str, total_epochs: int) -> List[int]:
+    raw = [x.strip() for x in str(text or "").split(",") if x.strip()]
+    vals: List[int] = []
+    for x in raw:
+        try:
+            vals.append(max(0, int(x)))
+        except Exception:
+            pass
+    if len(vals) >= 3 and sum(vals[:3]) > 0:
+        return vals[:3]
+    base = max(1, int(total_epochs) // 3)
+    rem = max(0, int(total_epochs) - base * 3)
+    out = [base, base, base]
+    for i in range(rem):
+        out[i % 3] += 1
+    return out
+
+
+def _parse_stage_lrs(text: str, base_lr: float) -> List[float]:
+    raw = [x.strip() for x in str(text or "").split(",") if x.strip()]
+    vals: List[float] = []
+    for x in raw:
+        try:
+            vals.append(float(x))
+        except Exception:
+            pass
+    if len(vals) >= 3:
+        return vals[:3]
+    return [float(base_lr), float(base_lr) * 0.5, float(base_lr) * 0.1]
+
+
+def _stage_for_epoch(epoch: int, stage_epochs: List[int]) -> int:
+    c1 = int(stage_epochs[0])
+    c2 = int(stage_epochs[0]) + int(stage_epochs[1])
+    if int(epoch) <= c1:
+        return 1
+    if int(epoch) <= c2:
+        return 2
+    return 3
 
 
 def _load_manifest_pairs(
@@ -102,6 +222,9 @@ class MedSamTuneDataset(Dataset):
         box_jitter_scale: float = 0.0,
         box_jitter_shift: float = 0.0,
         box_full_image_prob: float = 0.0,
+        num_pos_points: int = 1,
+        num_neg_points: int = 1,
+        point_jitter_frac: float = 0.03,
     ):
         self.image_size = image_size
         self.mask_threshold = int(mask_threshold)
@@ -110,6 +233,9 @@ class MedSamTuneDataset(Dataset):
         self.box_jitter_scale = float(max(0.0, box_jitter_scale))
         self.box_jitter_shift = float(max(0.0, box_jitter_shift))
         self.box_full_image_prob = float(max(0.0, min(1.0, box_full_image_prob)))
+        self.num_pos_points = int(max(1, num_pos_points))
+        self.num_neg_points = int(max(1, num_neg_points))
+        self.point_jitter_frac = float(max(0.0, point_jitter_frac))
         self.items: List[Tuple[str, Path, Path]] = []
 
         if pairs is not None:
@@ -215,6 +341,29 @@ class MedSamTuneDataset(Dataset):
     def __len__(self):
         return len(self.items)
 
+    def _sample_point(self, mask: np.ndarray, positive: bool) -> np.ndarray:
+        h, w = mask.shape[:2]
+        if positive:
+            ys, xs = np.where(mask > 0)
+        else:
+            ys, xs = np.where(mask == 0)
+        if len(xs) == 0:
+            x = 0.5 * float(max(1, w - 1))
+            y = 0.5 * float(max(1, h - 1))
+        else:
+            j = random.randint(0, len(xs) - 1)
+            x = float(xs[j])
+            y = float(ys[j])
+
+        if self.point_jitter_frac > 0.0:
+            jx = random.uniform(-self.point_jitter_frac, self.point_jitter_frac) * float(max(1, w - 1))
+            jy = random.uniform(-self.point_jitter_frac, self.point_jitter_frac) * float(max(1, h - 1))
+            x += jx
+            y += jy
+        x = max(0.0, min(float(max(0, w - 1)), x))
+        y = max(0.0, min(float(max(0, h - 1)), y))
+        return np.array([x, y], dtype=np.float32)
+
     def __getitem__(self, idx: int):
         key, image_path, mask_path = self.items[idx]
         image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
@@ -248,7 +397,24 @@ class MedSamTuneDataset(Dataset):
         image_t = torch.from_numpy(image).permute(2, 0, 1).float()
         mask_t = torch.from_numpy(mask).float().unsqueeze(0)
         box_t = torch.from_numpy(box).float()
-        return {"image": image_t, "mask": mask_t, "box": box_t, "id": key}
+        points = []
+        labels = []
+        for _ in range(self.num_pos_points):
+            points.append(self._sample_point(mask, positive=True))
+            labels.append(1)
+        for _ in range(self.num_neg_points):
+            points.append(self._sample_point(mask, positive=False))
+            labels.append(0)
+        point_coords_t = torch.from_numpy(np.stack(points, axis=0)).float()
+        point_labels_t = torch.tensor(labels, dtype=torch.long)
+        return {
+            "image": image_t,
+            "mask": mask_t,
+            "box": box_t,
+            "point_coords": point_coords_t,
+            "point_labels": point_labels_t,
+            "id": key,
+        }
 
 
 def dice_loss_from_logits(logits: torch.Tensor, target: torch.Tensor, smooth: float = 1.0):
@@ -260,6 +426,40 @@ def dice_loss_from_logits(logits: torch.Tensor, target: torch.Tensor, smooth: fl
     return 1.0 - dice.mean()
 
 
+def focal_loss_from_logits(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    alpha: float = 0.25,
+    gamma: float = 2.0,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    probs = torch.sigmoid(logits)
+    probs = probs.clamp(min=eps, max=1.0 - eps)
+    target = target.float()
+    p_t = probs * target + (1.0 - probs) * (1.0 - target)
+    alpha_t = alpha * target + (1.0 - alpha) * (1.0 - target)
+    loss = -alpha_t * torch.pow(1.0 - p_t, gamma) * torch.log(p_t)
+    return loss.mean()
+
+
+def _morph_gradient(x: torch.Tensor, radius: int) -> torch.Tensor:
+    r = int(max(0, radius))
+    if r <= 0:
+        return torch.zeros_like(x)
+    k = 2 * r + 1
+    maxp = F.max_pool2d(x, kernel_size=k, stride=1, padding=r)
+    minp = -F.max_pool2d(-x, kernel_size=k, stride=1, padding=r)
+    return (maxp - minp).clamp(0.0, 1.0)
+
+
+def boundary_loss_from_logits(logits: torch.Tensor, target: torch.Tensor, radius: int = 1) -> torch.Tensor:
+    probs = torch.sigmoid(logits).float()
+    tgt = target.float().clamp(0.0, 1.0)
+    pred_edge = _morph_gradient(probs, radius=radius)
+    tgt_edge = _morph_gradient(tgt, radius=radius)
+    return F.l1_loss(pred_edge, tgt_edge)
+
+
 def _safe_torch_load(path: str, map_location: str | torch.device | None = None):
     # Prefer weights_only=True to avoid pickle execution and future warning noise.
     try:
@@ -268,14 +468,24 @@ def _safe_torch_load(path: str, map_location: str | torch.device | None = None):
         return torch.load(path, map_location=map_location)
 
 
-def _forward_lowres_logits_with_grad(sam: nn.Module, image_chw: torch.Tensor, box_xyxy: torch.Tensor) -> torch.Tensor:
-    # image_chw: [3,H,W] in [0,255], box_xyxy: [4]
+def _forward_lowres_logits_with_grad(
+    sam: nn.Module,
+    image_chw: torch.Tensor,
+    box_xyxy: torch.Tensor | None,
+    point_coords: torch.Tensor | None,
+    point_labels: torch.Tensor | None,
+) -> torch.Tensor:
+    # image_chw: [3,H,W] in [0,255]
     input_image = sam.preprocess(image_chw)
     image_embeddings = sam.image_encoder(input_image.unsqueeze(0))
 
+    points_in = None
+    if point_coords is not None and point_labels is not None:
+        points_in = (point_coords.unsqueeze(0), point_labels.unsqueeze(0))
+    boxes_in = box_xyxy.unsqueeze(0) if box_xyxy is not None else None
     sparse_embeddings, dense_embeddings = sam.prompt_encoder(
-        points=None,
-        boxes=box_xyxy.unsqueeze(0),
+        points=points_in,
+        boxes=boxes_in,
         masks=None,
     )
     low_res_masks, _ = sam.mask_decoder(
@@ -286,6 +496,30 @@ def _forward_lowres_logits_with_grad(sam: nn.Module, image_chw: torch.Tensor, bo
         multimask_output=False,
     )
     return low_res_masks
+
+
+def _select_prompt_inputs(
+    prompt_mode: str,
+    box_xyxy: torch.Tensor,
+    point_coords: torch.Tensor,
+    point_labels: torch.Tensor,
+    mix_both_prob: float,
+    mix_box_only_prob: float,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, str]:
+    mode = str(prompt_mode).strip().lower()
+    if mode == "box_only":
+        return box_xyxy, None, None, "box"
+    if mode == "point_only":
+        return None, point_coords, point_labels, "point"
+
+    r = random.random()
+    p_both = float(max(0.0, min(1.0, mix_both_prob)))
+    p_box = float(max(0.0, min(1.0, mix_box_only_prob)))
+    if r < p_both:
+        return box_xyxy, point_coords, point_labels, "box+point"
+    if r < p_both + p_box:
+        return box_xyxy, None, None, "box"
+    return None, point_coords, point_labels, "point"
 
 
 def main():
@@ -299,11 +533,25 @@ def main():
     parser.add_argument("--split-filter", type=str, default="train,val")
     parser.add_argument("--mask-threshold", type=int, default=127)
     parser.add_argument("--init-lora-checkpoint", type=str, default="")
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--alpha", type=int, default=16)
+    parser.add_argument("--encoder-rank", type=int, default=-1)
+    parser.add_argument("--encoder-alpha", type=int, default=-1)
+    parser.add_argument("--decoder-rank", type=int, default=-1)
+    parser.add_argument("--decoder-alpha", type=int, default=-1)
+    parser.add_argument(
+        "--lora-target-keywords",
+        type=str,
+        default="qkv,proj,q_proj,k_proj,v_proj,out_proj,to_q,to_k,to_v",
+    )
+    parser.add_argument("--decoder-lora-target-keywords", type=str, default="")
+    parser.add_argument("--stage-epochs", type=str, default="10,10,10")
+    parser.add_argument("--stage-lrs", type=str, default="")
+    parser.add_argument("--unfreeze-encoder-tail-fraction", type=float, default=0.35)
     parser.add_argument("--image-size", type=int, default=1024)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
@@ -315,10 +563,50 @@ def main():
     parser.add_argument("--box-jitter-scale", type=float, default=0.30)
     parser.add_argument("--box-jitter-shift", type=float, default=0.25)
     parser.add_argument("--box-full-image-prob", type=float, default=0.03)
+    parser.add_argument("--num-pos-points", type=int, default=1)
+    parser.add_argument("--num-neg-points", type=int, default=1)
+    parser.add_argument("--point-jitter-frac", type=float, default=0.03)
+    parser.add_argument("--prompt-mode", type=str, default="box_point_mix", choices=["box_only", "point_only", "box_point_mix"])
+    parser.add_argument("--prompt-mix-both-prob", type=float, default=0.60)
+    parser.add_argument("--prompt-mix-box-only-prob", type=float, default=0.20)
+    parser.add_argument("--loss-dice", type=float, default=0.50)
+    parser.add_argument("--loss-focal", type=float, default=0.30)
+    parser.add_argument("--loss-boundary", type=float, default=0.20)
+    parser.add_argument("--focal-alpha", type=float, default=0.25)
+    parser.add_argument("--focal-gamma", type=float, default=2.0)
+    parser.add_argument("--boundary-radius", type=int, default=1)
     args = parser.parse_args()
 
     set_seed(args.seed)
     os.makedirs(Path(args.save_path).parent, exist_ok=True)
+
+    enc_rank = int(args.encoder_rank) if int(args.encoder_rank) > 0 else int(args.rank)
+    enc_alpha = int(args.encoder_alpha) if int(args.encoder_alpha) > 0 else int(args.alpha)
+    dec_rank = int(args.decoder_rank) if int(args.decoder_rank) > 0 else int(args.rank)
+    dec_alpha = int(args.decoder_alpha) if int(args.decoder_alpha) > 0 else int(args.alpha)
+
+    stage_epochs = _parse_stage_epochs(args.stage_epochs, total_epochs=int(args.epochs))
+    total_epochs = int(sum(stage_epochs))
+    if total_epochs != int(args.epochs):
+        print(f"[stage epochs] override epochs={int(args.epochs)} -> {total_epochs} from stage split {stage_epochs}")
+    args.epochs = int(total_epochs)
+    stage_lrs = _parse_stage_lrs(args.stage_lrs, base_lr=float(args.lr))
+
+    lora_keywords = [x.strip() for x in str(args.lora_target_keywords).split(",") if x.strip()]
+    dec_keywords = (
+        [x.strip() for x in str(args.decoder_lora_target_keywords).split(",") if x.strip()]
+        if str(args.decoder_lora_target_keywords).strip()
+        else lora_keywords
+    )
+    if not lora_keywords:
+        raise ValueError("No valid --lora-target-keywords were provided.")
+
+    loss_w_dice = float(args.loss_dice)
+    loss_w_focal = float(args.loss_focal)
+    loss_w_boundary = float(args.loss_boundary)
+    if (loss_w_dice + loss_w_focal + loss_w_boundary) <= 0.0:
+        loss_w_dice, loss_w_focal, loss_w_boundary = 1.0, 0.0, 0.0
+        print("[loss weights] all non-positive, fallback to Dice-only.")
 
     sam = sam_model_registry[args.model_type](checkpoint=None).to(args.device)
     base_state = _safe_torch_load(args.checkpoint, map_location=args.device)
@@ -329,15 +617,20 @@ def main():
     for p in sam.parameters():
         p.requires_grad = False
 
-    replaced = inject_lora(
+    replaced_encoder = inject_lora(
         sam.image_encoder,
-        target_keywords=["qkv", "proj", "q_proj", "k_proj", "v_proj"],
-        rank=args.rank,
-        alpha=args.alpha,
+        target_keywords=lora_keywords,
+        rank=enc_rank,
+        alpha=enc_alpha,
+        prefix="image_encoder",
     )
-    if args.train_mask_decoder:
-        for p in sam.mask_decoder.parameters():
-            p.requires_grad = True
+    replaced_decoder = inject_lora(
+        sam.mask_decoder,
+        target_keywords=dec_keywords,
+        rank=dec_rank,
+        alpha=dec_alpha,
+        prefix="mask_decoder",
+    )
 
     if args.init_lora_checkpoint:
         ckpt = _safe_torch_load(args.init_lora_checkpoint, map_location=args.device)
@@ -345,16 +638,41 @@ def main():
         missing, unexpected = sam.load_state_dict(state, strict=False)
         print(f"[resume] missing={len(missing)} unexpected={len(unexpected)} from {args.init_lora_checkpoint}")
 
-    trainable = [p for p in sam.parameters() if p.requires_grad]
-    if not trainable:
-        raise RuntimeError("No trainable parameters found. Check LoRA injection keywords.")
-    print(f"[LoRA] injected layers: {replaced}, trainable params: {sum(p.numel() for p in trainable)}")
+    potential_trainable = []
+    seen = set()
+    for n, p in sam.named_parameters():
+        ln = str(n).lower()
+        is_lora = ".lora_a" in ln or ".lora_b" in ln
+        if is_lora or (bool(args.train_mask_decoder) and ln.startswith("mask_decoder.")):
+            if id(p) not in seen:
+                potential_trainable.append(p)
+                seen.add(id(p))
+    if not potential_trainable:
+        raise RuntimeError("No trainable parameters found after LoRA injection.")
+
+    n_encoder_blocks = _collect_encoder_blocks(sam)
+    if n_encoder_blocks > 0:
+        tail_start = int((1.0 - float(max(0.0, min(1.0, args.unfreeze_encoder_tail_fraction)))) * n_encoder_blocks)
+        tail_start = max(0, min(n_encoder_blocks - 1, tail_start))
+    else:
+        tail_start = 0
+    enabled_stage1, total_adapt = _set_stage_trainable(
+        sam=sam,
+        stage_idx=1,
+        encoder_tail_start_block=tail_start,
+        train_mask_decoder_full=bool(args.train_mask_decoder),
+    )
+    print(
+        f"[LoRA] encoder_layers={replaced_encoder}, decoder_layers={replaced_decoder}, "
+        f"adapt_params_stage1={enabled_stage1}/{total_adapt}"
+    )
     print(
         "[LoRA train setup] "
         f"augment={bool(args.enable_augment)} prob={float(args.augment_prob):.2f} "
         f"box_jitter_scale={float(args.box_jitter_scale):.2f} "
         f"box_jitter_shift={float(args.box_jitter_shift):.2f} "
-        f"box_full_prob={float(args.box_full_image_prob):.2f}"
+        f"box_full_prob={float(args.box_full_image_prob):.2f} "
+        f"prompt={str(args.prompt_mode)} stage_epochs={stage_epochs} stage_lrs={stage_lrs}"
     )
 
     if args.data_manifest:
@@ -370,6 +688,9 @@ def main():
             box_jitter_scale=float(args.box_jitter_scale),
             box_jitter_shift=float(args.box_jitter_shift),
             box_full_image_prob=float(args.box_full_image_prob),
+            num_pos_points=int(args.num_pos_points),
+            num_neg_points=int(args.num_neg_points),
+            point_jitter_frac=float(args.point_jitter_frac),
         )
     else:
         dataset = MedSamTuneDataset(
@@ -382,6 +703,9 @@ def main():
             box_jitter_scale=float(args.box_jitter_scale),
             box_jitter_shift=float(args.box_jitter_shift),
             box_full_image_prob=float(args.box_full_image_prob),
+            num_pos_points=int(args.num_pos_points),
+            num_neg_points=int(args.num_neg_points),
+            point_jitter_frac=float(args.point_jitter_frac),
         )
 
     loader = DataLoader(
@@ -392,44 +716,110 @@ def main():
         pin_memory=True,
     )
 
-    optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=1e-4)
-    bce = nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.AdamW(potential_trainable, lr=float(stage_lrs[0]), weight_decay=float(args.weight_decay))
 
     best_loss = float("inf")
     sam.train()
+    last_stage = -1
+    last_lr = -1.0
     for epoch in range(1, args.epochs + 1):
+        stage_idx = _stage_for_epoch(epoch=epoch, stage_epochs=stage_epochs)
+        stage_lr = float(stage_lrs[max(0, min(2, stage_idx - 1))])
+        if stage_idx != last_stage:
+            enabled_now, total_now = _set_stage_trainable(
+                sam=sam,
+                stage_idx=stage_idx,
+                encoder_tail_start_block=tail_start,
+                train_mask_decoder_full=bool(args.train_mask_decoder),
+            )
+            print(
+                f"[stage] epoch={epoch}/{args.epochs} stage={stage_idx} "
+                f"trainable_params={enabled_now}/{total_now} tail_start_block={tail_start}"
+            )
+            last_stage = stage_idx
+        if abs(stage_lr - last_lr) > 1e-12:
+            for g in optimizer.param_groups:
+                g["lr"] = stage_lr
+            last_lr = stage_lr
+            print(f"[stage] set lr={stage_lr:.6g}")
+
         epoch_loss = 0.0
+        epoch_dice = 0.0
+        epoch_focal = 0.0
+        epoch_boundary = 0.0
         pbar = tqdm(loader, desc=f"epoch {epoch}/{args.epochs}")
         for batch in pbar:
             # SAM preprocess expects image values in [0,255], so keep raw scale here.
             images = batch["image"].to(args.device)
             masks = batch["mask"].to(args.device)
             boxes = batch["box"].to(args.device)
+            point_coords_all = batch["point_coords"].to(args.device)
+            point_labels_all = batch["point_labels"].to(args.device)
             batch_size = images.size(0)
 
             optimizer.zero_grad(set_to_none=True)
             loss_total = 0.0
+            loss_d = 0.0
+            loss_f = 0.0
+            loss_b = 0.0
 
             for i in range(batch_size):
+                box_in, p_coords_in, p_labels_in, _ = _select_prompt_inputs(
+                    prompt_mode=str(args.prompt_mode),
+                    box_xyxy=boxes[i],
+                    point_coords=point_coords_all[i],
+                    point_labels=point_labels_all[i],
+                    mix_both_prob=float(args.prompt_mix_both_prob),
+                    mix_box_only_prob=float(args.prompt_mix_box_only_prob),
+                )
                 logits = _forward_lowres_logits_with_grad(
                     sam=sam,
                     image_chw=images[i],
-                    box_xyxy=boxes[i],
+                    box_xyxy=box_in,
+                    point_coords=p_coords_in,
+                    point_labels=p_labels_in,
                 )
 
                 target_low = F.interpolate(masks[i].unsqueeze(0), size=logits.shape[-2:], mode="nearest")
-                loss = bce(logits, target_low) + dice_loss_from_logits(logits, target_low)
+                dice_l = dice_loss_from_logits(logits, target_low)
+                focal_l = focal_loss_from_logits(
+                    logits,
+                    target_low,
+                    alpha=float(args.focal_alpha),
+                    gamma=float(args.focal_gamma),
+                )
+                boundary_l = boundary_loss_from_logits(
+                    logits,
+                    target_low,
+                    radius=int(args.boundary_radius),
+                )
+                loss = (
+                    float(loss_w_dice) * dice_l
+                    + float(loss_w_focal) * focal_l
+                    + float(loss_w_boundary) * boundary_l
+                )
                 loss_total = loss_total + loss
+                loss_d = loss_d + float(dice_l.detach().item())
+                loss_f = loss_f + float(focal_l.detach().item())
+                loss_b = loss_b + float(boundary_l.detach().item())
 
             loss_total = loss_total / batch_size
             loss_total.backward()
             optimizer.step()
 
             epoch_loss += loss_total.item() * batch_size
-            pbar.set_postfix(loss=f"{loss_total.item():.4f}")
+            epoch_dice += loss_d
+            epoch_focal += loss_f
+            epoch_boundary += loss_b
+            pbar.set_postfix(loss=f"{loss_total.item():.4f}", stage=str(stage_idx))
 
         epoch_loss /= len(dataset)
-        print(f"epoch {epoch}/{args.epochs} | loss={epoch_loss:.4f}")
+        denom = max(1, len(dataset))
+        print(
+            f"epoch {epoch}/{args.epochs} | stage={stage_idx} lr={stage_lr:.6g} "
+            f"loss={epoch_loss:.4f} dice={epoch_dice/denom:.4f} "
+            f"focal={epoch_focal/denom:.4f} boundary={epoch_boundary/denom:.4f}"
+        )
 
         if epoch_loss < best_loss:
             best_loss = epoch_loss
@@ -438,8 +828,20 @@ def main():
                     "sam_state_dict": sam.state_dict(),
                     "best_loss": best_loss,
                     "epoch": epoch,
-                    "lora_rank": args.rank,
-                    "lora_alpha": args.alpha,
+                    "lora_rank": enc_rank,
+                    "lora_alpha": enc_alpha,
+                    "encoder_lora_rank": enc_rank,
+                    "encoder_lora_alpha": enc_alpha,
+                    "decoder_lora_rank": dec_rank,
+                    "decoder_lora_alpha": dec_alpha,
+                    "stage_epochs": stage_epochs,
+                    "stage_lrs": stage_lrs,
+                    "prompt_mode": str(args.prompt_mode),
+                    "loss_weights": {
+                        "dice": float(loss_w_dice),
+                        "focal": float(loss_w_focal),
+                        "boundary": float(loss_w_boundary),
+                    },
                 },
                 args.save_path,
             )

@@ -1,0 +1,117 @@
+﻿\documentclass[11pt]{article}
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{hyperref}
+
+\title{Review Notes and Revised Draft for Sections I--III\\
+\large SAM-Guided Data Augmentation for Colon Lesion Segmentation}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section*{Part A: Review Notes (Actionable)}
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{Template residue still appears in the manuscript.} The current PDF still contains IEEE template text in the title, abstract, and part of Section I. This should be fully replaced by task-specific writing to avoid desk rejection.
+\item \textbf{Dataset split description is inconsistent.} Section II-C mentions held-out centers as \texttt{C1--C4} and then \texttt{C5/C6}. The external hold-out set should be consistently described as \texttt{C5/C6}, while \texttt{C1--C4} should remain training centers only.
+\item \textbf{Notation and protocol need tighter definitions.} Key sets ($\mathcal{L}_{small}$, $\mathcal{U}_{large}$), confidence filtering rules, and stopping criteria for flywheel rounds should be defined once and reused consistently.
+\item \textbf{Method novelty should be stated as concrete contributions.} The introduction should explicitly separate: (i) low-label protocol, (ii) SAM-LoRA pseudo-label flywheel, (iii) frequency-decoupled student with edge-aware distillation.
+\item \textbf{Reproducibility is currently under-specified.} Include explicit split sizes, quality-control metrics, round-wise pseudo-label inclusion ratios, and decision thresholds for early stop.
+\item \textbf{Writing-level issues reduce clarity.} Several sentences are overly long or repetitive. Tightening the prose and reducing repeated claims improves readability and scientific credibility.
+\end{enumerate}
+
+\section*{Part B: Revised LaTeX Draft (Sections I--III)}
+
+\section{Introduction}
+Automatic polyp segmentation in colonoscopy images is a core component of computer-aided diagnosis, because precise lesion delineation can support detection, risk stratification, and procedural quality control. In real deployment, however, segmentation systems must generalize across centers, endoscope hardware, operators, and acquisition protocols. This requirement is difficult to satisfy when dense pixel-wise annotations are scarce, expensive, and time-consuming to collect.
+
+Recent foundation models such as Segment Anything and its medical adaptations (e.g., MedSAM) provide strong transferable priors, but directly deploying these large models in clinical workflows can be impractical due to interaction overhead and computational cost. In contrast, lightweight task-specific models are easier to deploy but typically depend on large amounts of expert annotation. This creates a practical gap: robust priors are available, but reliable supervision at scale is limited.
+
+To address this gap, we propose a low-annotation-budget teacher--student framework for colonoscopic polyp segmentation. A MedSAM-based teacher is adapted with LoRA on a small labeled subset and then used to generate pseudo labels on a large unlabeled pool. A frequency-decoupled ResSwinUNet student is trained on both real and pseudo supervision, together with boundary-aware consistency and teacher-guided distillation. The full pipeline forms a controlled data flywheel that amplifies limited expert annotations into scalable supervision while preserving deployment efficiency.
+
+The main contributions are summarized as follows:
+\begin{itemize}[leftmargin=1.5em]
+\item We define a leakage-aware low-annotation protocol over multiple public colonoscopy datasets, separating a small labeled subset from a large unlabeled pool and reserving strict external test sets.
+\item We introduce a two-round SAM-LoRA pseudo-label flywheel with quality control, enabling progressive supervision expansion while limiting noise accumulation.
+\item We design a frequency-decoupled ResSwinUNet student that combines hybrid CNN-Transformer encoding, wavelet bottleneck refinement, attention-gated decoding, and edge-aware supervision.
+\item We formulate joint optimization with supervised loss, confidence-weighted pseudo-label loss, edge consistency, and response/edge distillation to improve robustness under limited annotations.
+\end{itemize}
+
+\section{Dataset and Low-Annotation Protocol}
+\subsection{Data Sources and Label Budget Setting}
+The shared training universe is constructed from Kvasir-SEG, CVC-ClinicDB, and PolypGen training centers (C1--C4). Kvasir-SEG provides 1000 images and CVC-ClinicDB provides 612 images. PolypGen contributes 1241 images from centers C1--C4. Following a low-annotation-budget setting, only a small fraction of Kvasir-SEG and CVC-ClinicDB is treated as labeled, while the remaining samples plus PolypGen C1--C4 are used as unlabeled data.
+
+Concretely, the training universe contains 2853 images in total, with
+\begin{equation}
+|\mathcal{L}_{small}| = 161, \qquad |\mathcal{U}_{large}| = 2692.
+\end{equation}
+$\mathcal{L}_{small}$ is used for teacher adaptation and supervised student learning, while $\mathcal{U}_{large}$ is used for pseudo-label generation and semi-supervised expansion.
+
+\subsection{Ground-Truth and Pseudo-Label Construction}
+For samples in $\mathcal{L}_{small}$, masks are taken from official annotations (or expert-verified masks when needed). These labels are the only human-supervised pixel references used in training.
+
+For samples in $\mathcal{U}_{large}$, pseudo labels are generated by the adapted MedSAM teacher. Before pseudo labels enter student training, they are filtered by a quality-control pipeline including confidence, connected-component consistency, boundary smoothness, and region-size plausibility. High-confidence masks are directly accepted; medium-confidence masks can be quickly corrected; low-confidence masks are excluded or moved to a hard-sample pool.
+
+\subsection{External Test Sets and Generalization Evaluation}
+To evaluate out-of-distribution generalization, we use four strict external test sets: ETIS-LaribPolypDB (196), CVC-ColonDB (380), CVC-300 (60), and PolypGen hold-out centers C5/C6 (296). These sets are never used for model selection, threshold tuning, or hyperparameter search.
+
+This protocol evaluates not only in-domain segmentation quality but also robustness under realistic cross-center shift, which is essential for clinical deployment.
+
+\subsection{Leakage-Aware Splitting and Reproducibility}
+To prevent leakage, samples are split at patient level or sequence level whenever metadata is available. Frames from the same patient, examination, or sequence are assigned to one subset only. All teacher adaptation, pseudo-label generation, and student training steps follow this fixed split protocol.
+
+Annotation budget can be varied by changing $|\mathcal{L}_{small}|$ to simulate ultra-low, low, and moderate supervision. This enables controlled analysis of where performance gains originate: teacher adaptation, pseudo-label expansion, or student architecture.
+
+\section{Methodology}
+\subsection{Problem Definition}
+Let $x \in \mathbb{R}^{H \times W \times 3}$ denote an input image and $y \in \{0,1\}^{H \times W}$ its binary mask. Under low annotation budget, we have
+\begin{equation}
+\mathcal{L}_{small} = \{(x_i,y_i)\}_{i=1}^{N_l}, \qquad
+\mathcal{U}_{large} = \{x_j\}_{j=1}^{N_u}, \qquad N_l \ll N_u.
+\end{equation}
+The objective is to learn a deployable student model $f_s$ that achieves accurate segmentation by combining limited ground-truth supervision with teacher-generated pseudo supervision.
+
+\subsection{Overall Teacher--Student Framework}
+The framework contains three stages: (1) adapt a MedSAM-based teacher on $\mathcal{L}_{small}$, (2) generate and filter pseudo labels on $\mathcal{U}_{large}$, and (3) train a lightweight student (ResSwinUNet) using real labels, pseudo labels, and distillation cues. This decouples representation acquisition (teacher) from deployment efficiency (student).
+
+\subsection{SAM-LoRA Teacher Adaptation and Pseudo-Labeling}
+We initialize the teacher from MedSAM and adapt it with low-rank adaptation (LoRA), injecting trainable low-rank matrices into selected attention layers while freezing most backbone parameters. This improves domain fit under limited labels and reduces optimization cost.
+
+During pseudo-label generation, prompts (box/point/candidate region) are used to trigger mask prediction. The teacher output is treated as structured supervision rather than direct annotation, and is always passed through quality control before student training.
+
+\subsection{Two-Round Data Flywheel}
+To control noise accumulation, pseudo-label expansion is limited to two rounds.
+\begin{itemize}[leftmargin=1.5em]
+\item \textbf{Round 0:} adapt MedSAM on $\mathcal{L}_{small}$ to obtain teacher $T_0$.
+\item \textbf{Round 1:} apply $T_0$ to $\mathcal{U}_{large}$; filter pseudo labels; add top high-quality samples (e.g., 30\%--50\%) to training.
+\item \textbf{Round 2:} reprocess hard samples using the improved teacher (or teacher+student assistance); add another reliable subset (e.g., 10\%--20\%).
+\end{itemize}
+The flywheel stops when gain saturates, for example when external validation Dice improvement is below a preset margin or manual spot-check pass rate drops below an acceptable threshold.
+
+\subsection{Frequency-Decoupled ResSwinUNet Student}
+The student uses a hybrid encoder-decoder architecture:
+\begin{itemize}[leftmargin=1.5em]
+\item \textbf{Hybrid encoder:} shallow residual convolution captures texture and boundary primitives; deeper Swin stages model long-range context.
+\item \textbf{Wavelet bottleneck:} Haar DWT decomposes bottleneck features into low-frequency semantic branch (LL) and high-frequency detail branches (LH/HL/HH), followed by high-frequency refinement and IDWT fusion.
+\item \textbf{Attention-gated decoder:} skip connections are modulated to suppress irrelevant shallow activations, improving multi-scale fusion.
+\end{itemize}
+This design aims to preserve lesion boundaries while maintaining global semantic discrimination.
+
+\subsection{Edge Consistency and Distillation}
+To improve contour quality without a heavy boundary branch, we apply edge consistency on logits. Let $E(\cdot)$ be an edge operator (e.g., Sobel). The predicted edge map $E(\sigma(z_s))$ is matched to the mask-derived edge target.
+
+We further introduce teacher--student distillation with two components: (i) response distillation aligning student probabilities with teacher soft masks, and (ii) edge distillation transferring contour priors.
+
+\subsection{Joint Optimization}
+The total objective is
+\begin{equation}
+\mathcal{L}_{total} = \lambda_1 \mathcal{L}_{sup} + \lambda_2 \mathcal{L}_{pseudo} + \lambda_3 \mathcal{L}_{edge} + \lambda_4 \mathcal{L}_{distill}.
+\end{equation}
+$\mathcal{L}_{sup}$ is computed on $\mathcal{L}_{small}$ (Dice + Focal/BCE), $\mathcal{L}_{pseudo}$ is confidence-weighted on pseudo-labeled data, $\mathcal{L}_{edge}$ enforces contour consistency, and $\mathcal{L}_{distill}$ combines soft-response and edge-level transfer.
+
+To reduce optimization conflict, training uses staged activation and dynamic weighting: supervised learning first, then edge regularization, then pseudo-label supervision, and finally distillation with conservative initial weight.
+
+\end{document}

@@ -98,6 +98,32 @@ def _load_proposals(path: str) -> dict[str, list[float]]:
     return out
 
 
+def _load_csv_rows(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        return [dict(r) for r in csv.DictReader(f)]
+
+
+def _map_rows_by_id(rows: list[dict]) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for row in rows:
+        pid = str(row.get("id", "")).strip()
+        if pid:
+            out[pid] = row
+    return out
+
+
+def _group_rows_by_id(rows: list[dict]) -> dict[str, list[dict]]:
+    out: dict[str, list[dict]] = {}
+    for row in rows:
+        pid = str(row.get("id", "")).strip()
+        if not pid:
+            continue
+        out.setdefault(pid, []).append(row)
+    return out
+
+
 def _edge_from_prob(prob: np.ndarray) -> np.ndarray:
     gx = cv2.Sobel(prob, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(prob, cv2.CV_32F, 0, 1, ksize=3)
@@ -837,14 +863,40 @@ class LoRALinear(nn.Module):
         return base_out + self.scale * delta
 
 
-def inject_lora(module: nn.Module, target_keywords: list[str], rank: int, alpha: int) -> int:
+def _match_any(text: str, keywords: list[str]) -> bool:
+    t = str(text).strip().lower()
+    return any(str(k).strip().lower() in t for k in keywords if str(k).strip())
+
+
+def inject_lora(
+    module: nn.Module,
+    target_keywords: list[str],
+    rank: int,
+    alpha: int,
+    prefix: str = "",
+    exclude_keywords: list[str] | None = None,
+) -> int:
     replaced = 0
+    excludes = exclude_keywords or []
     for name, child in list(module.named_children()):
-        if isinstance(child, nn.Linear) and any(k in name.lower() for k in target_keywords):
+        full_name = f"{prefix}.{name}" if prefix else name
+        full_name_l = full_name.lower()
+        if (
+            isinstance(child, nn.Linear)
+            and _match_any(full_name_l, target_keywords)
+            and not _match_any(full_name_l, excludes)
+        ):
             setattr(module, name, LoRALinear(child, rank=rank, alpha=alpha))
             replaced += 1
         else:
-            replaced += inject_lora(child, target_keywords, rank, alpha)
+            replaced += inject_lora(
+                child,
+                target_keywords=target_keywords,
+                rank=rank,
+                alpha=alpha,
+                prefix=full_name,
+                exclude_keywords=excludes,
+            )
     return replaced
 
 
@@ -1074,6 +1126,12 @@ def main():
     parser.add_argument("--output-root", type=str, default="runs/flywheel/round1/pseudo")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--skip-exist", action="store_true")
+    parser.add_argument(
+        "--flush-every",
+        type=int,
+        default=0,
+        help="If >0, periodically flush CSV outputs every N accumulated rows for robust resume.",
+    )
     parser.add_argument("--save-panels", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--overlay-alpha", type=float, default=0.45)
     parser.add_argument("--write-gallery", action=argparse.BooleanOptionalAction, default=True)
@@ -1121,15 +1179,29 @@ def main():
         ckpt = _safe_torch_load(args.lora_checkpoint, map_location=args.device)
         state = ckpt.get("sam_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
         if isinstance(state, dict) and any(".lora_a" in k for k in state.keys()):
-            rank = int(ckpt.get("lora_rank", 8)) if isinstance(ckpt, dict) else 8
-            alpha = int(ckpt.get("lora_alpha", 16)) if isinstance(ckpt, dict) else 16
-            replaced = inject_lora(
+            enc_rank = int(ckpt.get("encoder_lora_rank", ckpt.get("lora_rank", 8))) if isinstance(ckpt, dict) else 8
+            enc_alpha = int(ckpt.get("encoder_lora_alpha", ckpt.get("lora_alpha", 16))) if isinstance(ckpt, dict) else 16
+            dec_rank = int(ckpt.get("decoder_lora_rank", ckpt.get("lora_rank", 8))) if isinstance(ckpt, dict) else 8
+            dec_alpha = int(ckpt.get("decoder_lora_alpha", ckpt.get("lora_alpha", 16))) if isinstance(ckpt, dict) else 16
+            lora_keywords = ["qkv", "proj", "q_proj", "k_proj", "v_proj", "out_proj", "to_q", "to_k", "to_v"]
+            replaced_enc = inject_lora(
                 model.image_encoder,
-                target_keywords=["qkv", "proj", "q_proj", "k_proj", "v_proj"],
-                rank=rank,
-                alpha=alpha,
+                target_keywords=lora_keywords,
+                rank=enc_rank,
+                alpha=enc_alpha,
+                prefix="image_encoder",
             )
-            print(f"[teacher lora] injected layers={replaced}, rank={rank}, alpha={alpha}")
+            replaced_dec = inject_lora(
+                model.mask_decoder,
+                target_keywords=lora_keywords,
+                rank=dec_rank,
+                alpha=dec_alpha,
+                prefix="mask_decoder",
+            )
+            print(
+                f"[teacher lora] injected encoder_layers={replaced_enc} (r={enc_rank},a={enc_alpha}) "
+                f"decoder_layers={replaced_dec} (r={dec_rank},a={dec_alpha})"
+            )
         missing, unexpected = model.load_state_dict(state, strict=False)
         print(f"[teacher load] missing={len(missing)} unexpected={len(unexpected)} from {args.lora_checkpoint}")
     predictor = SamPredictor(model)
@@ -1137,6 +1209,120 @@ def main():
     quality_rows = []
     manifest_rows = []
     candidate_rows = []
+    existing_quality_by_id: dict[str, dict] = {}
+    existing_manifest_by_id: dict[str, dict] = {}
+    existing_candidate_by_id: dict[str, list[dict]] = {}
+    skip_reused = 0
+    skip_recompute_needed = 0
+    num_newly_inferred = 0
+    target_ids = {str(r.get("id", "")).strip() for r in rows if str(r.get("id", "")).strip()}
+    if args.skip_exist:
+        quality_cache = _map_rows_by_id(_load_csv_rows(out_root / "pseudo_quality.csv"))
+        manifest_cache = _map_rows_by_id(_load_csv_rows(out_root / "pseudo_candidates_manifest.csv"))
+        candidate_cache = _group_rows_by_id(_load_csv_rows(out_root / "candidate_scores.csv"))
+        if target_ids:
+            existing_quality_by_id = {k: v for k, v in quality_cache.items() if k in target_ids}
+            existing_manifest_by_id = {k: v for k, v in manifest_cache.items() if k in target_ids}
+            existing_candidate_by_id = {k: v for k, v in candidate_cache.items() if k in target_ids}
+        else:
+            existing_quality_by_id = quality_cache
+            existing_manifest_by_id = manifest_cache
+            existing_candidate_by_id = candidate_cache
+        print(
+            "[skip-exist] cached rows loaded: "
+            f"quality={len(existing_quality_by_id)} manifest={len(existing_manifest_by_id)} "
+            f"candidate_ids={len(existing_candidate_by_id)}"
+        )
+
+    quality_fieldnames = [
+        "id",
+        "image_path",
+        "hard_mask_path",
+        "panel_path",
+        "soft_path",
+        "edge_path",
+        "prompt_box",
+        "prompt_source",
+        "refine_stage",
+        "prompt_points",
+        "subset",
+        "source",
+        "center",
+        "conf",
+        "edge_quality",
+        "area_ratio",
+        "area_prior",
+        "center_prior",
+        "box_in_ratio",
+        "spill_ratio",
+        "reflection_overlap",
+        "largest_cc_ratio",
+        "num_components",
+        "consistency_iou",
+        "quality_gap",
+        "quality",
+        "round_id",
+    ]
+    manifest_fieldnames = [
+        "id",
+        "image_path",
+        "mask_path",
+        "subset",
+        "split",
+        "source",
+        "center",
+        "is_labeled",
+        "is_pseudo",
+        "pseudo_weight",
+        "round_id",
+        "exclude_from_tuning",
+        "soft_path",
+        "edge_path",
+    ]
+    candidate_fieldnames = [
+        "id",
+        "rank",
+        "selected",
+        "quality",
+        "conf",
+        "edge_quality",
+        "area_ratio",
+        "area_prior",
+        "center_prior",
+        "box_in_ratio",
+        "spill_ratio",
+        "reflection_overlap",
+        "largest_cc_ratio",
+        "num_components",
+        "prompt_source",
+        "prompt_box",
+        "refine_stage",
+        "prompt_points",
+        "source",
+        "subset",
+    ]
+
+    quality_csv = out_root / "pseudo_quality.csv"
+    manifest_csv = out_root / "pseudo_candidates_manifest.csv"
+    candidate_csv = out_root / "candidate_scores.csv"
+    gallery_html = out_root / "mask_gallery.html"
+
+    def _flush_outputs(write_gallery_now: bool = False):
+        with open(quality_csv, "w", encoding="utf-8", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=quality_fieldnames)
+            w.writeheader()
+            w.writerows(quality_rows)
+        with open(manifest_csv, "w", encoding="utf-8", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=manifest_fieldnames)
+            w.writeheader()
+            w.writerows(manifest_rows)
+        if args.write_candidate_scores and candidate_rows:
+            with open(candidate_csv, "w", encoding="utf-8", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=candidate_fieldnames)
+                w.writeheader()
+                w.writerows(candidate_rows)
+        if write_gallery_now and args.write_gallery:
+            _write_gallery(quality_rows, gallery_html)
     for row in tqdm(rows, desc="Pseudo Labeling"):
         pid = row["id"]
         out_hard = hard_dir / f"{pid}.png"
@@ -1145,8 +1331,20 @@ def main():
         out_panel = panel_dir / f"{pid}.jpg"
         core_ready = out_hard.exists() and out_soft.exists() and out_edge.exists()
         panel_ready = (not args.save_panels) or out_panel.exists()
-        if args.skip_exist and core_ready and panel_ready:
+        can_reuse_quality = pid in existing_quality_by_id
+        can_reuse_manifest = pid in existing_manifest_by_id
+        can_reuse_candidate = (not args.write_candidate_scores) or (pid in existing_candidate_by_id)
+        if args.skip_exist and core_ready and panel_ready and can_reuse_quality and can_reuse_manifest and can_reuse_candidate:
+            quality_rows.append(existing_quality_by_id[pid])
+            manifest_rows.append(existing_manifest_by_id[pid])
+            if args.write_candidate_scores:
+                candidate_rows.extend(existing_candidate_by_id.get(pid, []))
+            skip_reused += 1
             continue
+        if args.skip_exist and core_ready and panel_ready:
+            # Existing image artifacts were found but CSV history is incomplete.
+            # Recompute this sample so recovered outputs stay self-consistent.
+            skip_recompute_needed += 1
 
         image_bgr = cv2.imread(row["image_path"], cv2.IMREAD_COLOR)
         if image_bgr is None:
@@ -1552,6 +1750,7 @@ def main():
             cv2.imwrite(str(out_panel), panel)
             panel_path = str(out_panel)
 
+        num_newly_inferred += 1
         quality_rows.append(
             {
                 "id": pid,
@@ -1601,101 +1800,31 @@ def main():
                 "edge_path": str(out_edge),
             }
         )
+        flush_every = int(max(0, args.flush_every))
+        if flush_every > 0 and len(quality_rows) > 0 and (len(quality_rows) % flush_every == 0):
+            _flush_outputs(write_gallery_now=False)
+            print(
+                json.dumps(
+                    {
+                        "flush": True,
+                        "rows_written": int(len(quality_rows)),
+                        "num_newly_inferred": int(num_newly_inferred),
+                        "num_reused_existing": int(skip_reused),
+                        "num_recomputed_due_to_missing_history": int(skip_recompute_needed),
+                    },
+                    ensure_ascii=False,
+                )
+            )
 
-    quality_csv = out_root / "pseudo_quality.csv"
-    with open(quality_csv, "w", encoding="utf-8", newline="") as f:
-        fieldnames = [
-            "id",
-            "image_path",
-            "hard_mask_path",
-            "panel_path",
-            "soft_path",
-            "edge_path",
-            "prompt_box",
-            "prompt_source",
-            "refine_stage",
-            "prompt_points",
-            "subset",
-            "source",
-            "center",
-            "conf",
-            "edge_quality",
-            "area_ratio",
-            "area_prior",
-            "center_prior",
-            "box_in_ratio",
-            "spill_ratio",
-            "reflection_overlap",
-            "largest_cc_ratio",
-            "num_components",
-            "consistency_iou",
-            "quality_gap",
-            "quality",
-            "round_id",
-        ]
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        w.writerows(quality_rows)
-
-    manifest_csv = out_root / "pseudo_candidates_manifest.csv"
-    with open(manifest_csv, "w", encoding="utf-8", newline="") as f:
-        fieldnames = [
-            "id",
-            "image_path",
-            "mask_path",
-            "subset",
-            "split",
-            "source",
-            "center",
-            "is_labeled",
-            "is_pseudo",
-            "pseudo_weight",
-            "round_id",
-            "exclude_from_tuning",
-            "soft_path",
-            "edge_path",
-        ]
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        w.writerows(manifest_rows)
-
-    candidate_csv = out_root / "candidate_scores.csv"
-    if args.write_candidate_scores and candidate_rows:
-        with open(candidate_csv, "w", encoding="utf-8", newline="") as f:
-            fieldnames = [
-                "id",
-                "rank",
-                "selected",
-                "quality",
-                "conf",
-                "edge_quality",
-                "area_ratio",
-                "area_prior",
-                "center_prior",
-                "box_in_ratio",
-                "spill_ratio",
-                "reflection_overlap",
-                "largest_cc_ratio",
-                "num_components",
-                "prompt_source",
-                "prompt_box",
-                "refine_stage",
-                "prompt_points",
-                "source",
-                "subset",
-            ]
-            w = csv.DictWriter(f, fieldnames=fieldnames)
-            w.writeheader()
-            w.writerows(candidate_rows)
-
-    gallery_html = out_root / "mask_gallery.html"
-    if args.write_gallery:
-        _write_gallery(quality_rows, gallery_html)
+    _flush_outputs(write_gallery_now=bool(args.write_gallery))
 
     print(
         json.dumps(
             {
                 "num_processed": len(quality_rows),
+                "num_newly_inferred": int(num_newly_inferred),
+                "num_reused_existing": int(skip_reused),
+                "num_recomputed_due_to_missing_history": int(skip_recompute_needed),
                 "quality_csv": str(quality_csv),
                 "pseudo_candidates_manifest": str(manifest_csv),
                 "hard_masks_dir": str(hard_dir),

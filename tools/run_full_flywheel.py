@@ -48,6 +48,42 @@ def _run_if_outputs_missing(step_name: str, done_paths: list[Path], cmd: list[st
     _run(cmd)
 
 
+def _read_checkpoint_epoch(checkpoint_path: Path) -> int | None:
+    p = Path(checkpoint_path)
+    if not p.exists():
+        return None
+    try:
+        import torch  # local import to avoid hard dependency for non-training flows
+        ckpt = torch.load(str(p), map_location="cpu")
+    except Exception as exc:
+        print(f"[checkpoint inspect] failed to read epoch from {p}: {exc}")
+        return None
+    if isinstance(ckpt, dict) and "epoch" in ckpt:
+        try:
+            return int(ckpt.get("epoch", 0))
+        except Exception:
+            return None
+    return None
+
+
+def _is_lora_checkpoint_complete(checkpoint_path: Path, expected_epochs: int) -> bool:
+    p = Path(checkpoint_path)
+    if not p.exists():
+        return False
+    ep = _read_checkpoint_epoch(p)
+    if ep is None:
+        # Keep backward compatibility for checkpoints without epoch metadata.
+        print(f"[checkpoint inspect] no epoch metadata in {p}, treat as complete for compatibility.")
+        return True
+    ok = int(ep) >= int(expected_epochs)
+    if not ok:
+        print(
+            f"[checkpoint inspect] incomplete checkpoint: {p} "
+            f"(epoch={ep} < expected={int(expected_epochs)}), will rerun this stage."
+        )
+    return ok
+
+
 def _path_to_uri(path_text: str) -> str:
     if not path_text:
         return ""
@@ -120,10 +156,11 @@ def _build_flywheel_gallery(round_quality_csvs: list[tuple[int, str]], output_ht
     return str(out)
 
 
-def _merge_teacher_manifest(base_manifest: str, selected_manifest: str, output: str):
+def _merge_teacher_manifest(base_manifest: str, selected_manifest: str, output: str, keep_subsets: set[str] | None = None):
     base_rows = _read_csv(base_manifest)
     sel_rows = _read_csv(selected_manifest)
-    keep = [r for r in base_rows if str(r.get("subset", "")).strip() == "L_small"]
+    keep_set = keep_subsets if keep_subsets is not None else {"L_small"}
+    keep = [r for r in base_rows if str(r.get("subset", "")).strip() in keep_set]
     merged = keep + sel_rows
     fields = [
         "id",
@@ -150,7 +187,7 @@ def _merge_teacher_manifest(base_manifest: str, selected_manifest: str, output: 
 
 def _build_student_manifest(base_manifest: str, selected_manifests: list[str], output: str):
     base_rows = _read_csv(base_manifest)
-    keep_base = [r for r in base_rows if str(r.get("subset", "")).strip() in {"L_small", "external"}]
+    keep_base = [r for r in base_rows if str(r.get("subset", "")).strip() in {"L_small", "L_adapt_polypgen", "external"}]
     merged = keep_base
     for p in selected_manifests:
         if p and Path(p).exists():
@@ -206,6 +243,48 @@ def _filter_manifest_by_ids(input_manifest: str, keep_ids: set[str], output_mani
     return int(len(out))
 
 
+def _review_non_reject_ids(review_csv: str) -> set[str]:
+    p = Path(review_csv)
+    if not p.exists():
+        return set()
+    ids: set[str] = set()
+    for r in _read_csv(str(p)):
+        pid = str(r.get("id", "")).strip()
+        if not pid:
+            continue
+        decision = str(r.get("decision", "")).strip().lower()
+        if not decision:
+            continue
+        if decision in {"reject", "drop", "discard", "bad"}:
+            continue
+        ids.add(pid)
+    return ids
+
+
+def _augment_manifest_with_ids(base_manifest: str, source_manifest: str, add_ids: set[str], output_manifest: str) -> tuple[int, int]:
+    base_rows = _read_csv(base_manifest) if Path(base_manifest).exists() else []
+    src_rows = _read_csv(source_manifest) if Path(source_manifest).exists() else []
+    if not base_rows and not src_rows:
+        _write_csv(output_manifest, [], [])
+        return 0, 0
+
+    fields = list(base_rows[0].keys()) if base_rows else list(src_rows[0].keys())
+    out = list(base_rows)
+    seen = {str(r.get("id", "")).strip() for r in out}
+    added = 0
+    for r in src_rows:
+        pid = str(r.get("id", "")).strip()
+        if not pid or pid in seen:
+            continue
+        if pid not in add_ids:
+            continue
+        out.append(r)
+        seen.add(pid)
+        added += 1
+    _write_csv(output_manifest, out, fields)
+    return int(len(out)), int(added)
+
+
 def _round_quality_guard(
     quality_csv: str,
     large_mask_threshold: float,
@@ -241,6 +320,25 @@ def _round_quality_guard(
         raise RuntimeError(
             "Round quality guard failed: too many overly-large masks. "
             "Please inspect round1 mask gallery and tighten pseudo settings."
+        )
+
+
+def _pseudo_artifact_guard(quality_csv: str, hard_masks_dir: str, enabled: bool = True):
+    if not enabled:
+        return
+    qpath = Path(quality_csv)
+    mdir = Path(hard_masks_dir)
+    if not qpath.exists() or not mdir.exists():
+        return
+    rows = _read_csv(str(qpath))
+    n_quality = int(len(rows))
+    n_masks = int(sum(1 for p in mdir.glob("*.png") if p.is_file()))
+    print(f"[pseudo artifact guard] quality_rows={n_quality} hard_masks={n_masks}")
+    if n_quality != n_masks:
+        raise RuntimeError(
+            "Pseudo artifact guard failed: pseudo_quality row count mismatches hard mask files. "
+            "This usually indicates stale masks or partial resume outputs. "
+            "Please rerun pseudo generation to rebuild metadata and gallery."
         )
 
 
@@ -392,6 +490,9 @@ def _run_lora_qc(
     teacher_checkpoint: str,
     dice_min: float,
     bf1_min: float,
+    subset_filter: str,
+    polypgen_dice_min: float,
+    polypgen_bf1_min: float,
     worst_k: int,
 ):
     if cv2 is None or np is None:
@@ -405,10 +506,13 @@ def _run_lora_qc(
     qc_root.mkdir(parents=True, exist_ok=True)
 
     manifest_rows = _read_csv(data_manifest)
+    qc_subsets = {s.strip() for s in str(subset_filter or "").split(",") if s.strip()}
+    if not qc_subsets:
+        qc_subsets = {"L_small"}
     val_rows = [
         r
         for r in manifest_rows
-        if str(r.get("subset", "")).strip() == "L_small"
+        if str(r.get("subset", "")).strip() in qc_subsets
         and str(r.get("split", "")).strip() == "val"
         and str(r.get("mask_path", "")).strip()
     ]
@@ -416,14 +520,14 @@ def _run_lora_qc(
         val_rows = [
             r
             for r in manifest_rows
-            if str(r.get("subset", "")).strip() == "L_small"
+            if str(r.get("subset", "")).strip() in qc_subsets
             and str(r.get("mask_path", "")).strip()
         ]
     if not val_rows:
-        raise RuntimeError("LoRA QC failed: no L_small val rows found in manifest.")
+        raise RuntimeError(f"LoRA QC failed: no val rows found for subsets={sorted(qc_subsets)} in manifest.")
 
-    id_filter = qc_root / "l_small_val_ids.txt"
-    proposal_json = qc_root / "l_small_val_gt_boxes.json"
+    id_filter = qc_root / "qc_val_ids.txt"
+    proposal_json = qc_root / "qc_val_gt_boxes.json"
     id_to_gt = {}
     proposals = {}
     for r in val_rows:
@@ -450,7 +554,7 @@ def _run_lora_qc(
             "--data-manifest",
             data_manifest,
             "--subset-filter",
-            "L_small",
+            ",".join(sorted(qc_subsets)),
             "--id-filter",
             str(id_filter),
             "--proposal-json",
@@ -500,6 +604,22 @@ def _run_lora_qc(
     per_sample.sort(key=lambda x: x["dice"])
     dice_mean = float(np.mean([x["dice"] for x in per_sample]))
     bf1_mean = float(np.mean([x["boundary_f1"] for x in per_sample]))
+    source_summary = {}
+    for row in per_sample:
+        src = str(row.get("source", "")).strip() or "unknown"
+        source_summary.setdefault(src, {"dice": [], "bf1": []})
+        source_summary[src]["dice"].append(float(row["dice"]))
+        source_summary[src]["bf1"].append(float(row["boundary_f1"]))
+    by_source = {}
+    for src, v in source_summary.items():
+        by_source[src] = {
+            "count": int(len(v["dice"])),
+            "dice_mean": float(np.mean(v["dice"])) if v["dice"] else 0.0,
+            "boundary_f1_mean": float(np.mean(v["bf1"])) if v["bf1"] else 0.0,
+        }
+    polypgen_rows = [x for x in per_sample if "polypgen" in str(x.get("source", "")).lower()]
+    polypgen_dice_mean = float(np.mean([x["dice"] for x in polypgen_rows])) if polypgen_rows else 0.0
+    polypgen_bf1_mean = float(np.mean([x["boundary_f1"] for x in polypgen_rows])) if polypgen_rows else 0.0
     _write_csv(
         str(qc_root / "per_sample.csv"),
         per_sample,
@@ -517,8 +637,15 @@ def _run_lora_qc(
         "num_samples": len(per_sample),
         "dice_mean": dice_mean,
         "boundary_f1_mean": bf1_mean,
+        "subset_filter": ",".join(sorted(qc_subsets)),
         "dice_min_gate": float(dice_min),
         "boundary_f1_min_gate": float(bf1_min),
+        "polypgen_samples": int(len(polypgen_rows)),
+        "polypgen_dice_mean": float(polypgen_dice_mean),
+        "polypgen_boundary_f1_mean": float(polypgen_bf1_mean),
+        "polypgen_dice_min_gate": float(polypgen_dice_min),
+        "polypgen_boundary_f1_min_gate": float(polypgen_bf1_min),
+        "by_source": by_source,
         "per_sample_csv": str(qc_root / "per_sample.csv"),
         "worst_cases_dir": str(worst_dir),
     }
@@ -530,9 +657,23 @@ def _run_lora_qc(
             f"dice_mean={dice_mean:.4f} (min={dice_min:.4f}), "
             f"boundary_f1_mean={bf1_mean:.4f} (min={bf1_min:.4f})"
         )
+    if polypgen_rows and (
+        polypgen_dice_mean < float(polypgen_dice_min) or polypgen_bf1_mean < float(polypgen_bf1_min)
+    ):
+        raise RuntimeError(
+            "LoRA QC PolypGen gate failed: "
+            f"dice_mean={polypgen_dice_mean:.4f} (min={polypgen_dice_min:.4f}), "
+            f"boundary_f1_mean={polypgen_bf1_mean:.4f} (min={polypgen_bf1_min:.4f})"
+        )
 
 
-def _reuse_or_validate_lora_qc(metrics_path: Path, dice_min: float, bf1_min: float):
+def _reuse_or_validate_lora_qc(
+    metrics_path: Path,
+    dice_min: float,
+    bf1_min: float,
+    polypgen_dice_min: float,
+    polypgen_bf1_min: float,
+):
     if not metrics_path.exists():
         return False
     try:
@@ -546,6 +687,16 @@ def _reuse_or_validate_lora_qc(metrics_path: Path, dice_min: float, bf1_min: flo
             "Existing LoRA QC metrics fail gate: "
             f"dice_mean={dice_mean:.4f} (min={dice_min:.4f}), "
             f"boundary_f1_mean={bf1_mean:.4f} (min={bf1_min:.4f}). "
+            "Remove old outputs or retrain teacher."
+        )
+    poly_n = int(data.get("polypgen_samples", 0))
+    poly_d = float(data.get("polypgen_dice_mean", 0.0))
+    poly_b = float(data.get("polypgen_boundary_f1_mean", 0.0))
+    if poly_n > 0 and (poly_d < float(polypgen_dice_min) or poly_b < float(polypgen_bf1_min)):
+        raise RuntimeError(
+            "Existing LoRA QC PolypGen metrics fail gate: "
+            f"dice_mean={poly_d:.4f} (min={polypgen_dice_min:.4f}), "
+            f"boundary_f1_mean={poly_b:.4f} (min={polypgen_bf1_min:.4f}). "
             "Remove old outputs or retrain teacher."
         )
     print(f"[skip] lora_qc (reuse {metrics_path})")
@@ -847,9 +998,11 @@ def main():
     parser.add_argument("--large-mask-threshold", type=float, default=0.40)
     parser.add_argument("--max-large-mask-frac", type=float, default=0.35)
     parser.add_argument("--teacher-refresh-between-rounds", type=str, default="true")
-    parser.add_argument("--manual-review-per-round", type=int, default=200)
-    parser.add_argument("--manual-box-review-count", type=int, default=140)
-    parser.add_argument("--manual-mask-review-count", type=int, default=60)
+    parser.add_argument("--teacher-subset-filter", type=str, default="L_small,L_adapt_polypgen")
+    parser.add_argument("--teacher-refresh-subset-filter", type=str, default="L_small,L_adapt_polypgen,pseudo_round1")
+    parser.add_argument("--manual-review-per-round", type=int, default=220)
+    parser.add_argument("--manual-box-review-count", type=int, default=120)
+    parser.add_argument("--manual-mask-review-count", type=int, default=100)
     parser.add_argument(
         "--manual-mask-hard-fraction",
         type=float,
@@ -878,6 +1031,9 @@ def main():
     parser.add_argument("--skip-lora-qc", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--lora-qc-dice-min", type=float, default=0.70)
     parser.add_argument("--lora-qc-bf1-min", type=float, default=0.28)
+    parser.add_argument("--lora-qc-subset-filter", type=str, default="L_small,L_adapt_polypgen")
+    parser.add_argument("--lora-qc-polypgen-dice-min", type=float, default=0.68)
+    parser.add_argument("--lora-qc-polypgen-bf1-min", type=float, default=0.26)
     parser.add_argument("--lora-qc-worst-k", type=int, default=40)
     parser.add_argument("--enable-quality-calibration", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--calibration-ridge-alpha", type=float, default=1e-3)
@@ -885,16 +1041,44 @@ def main():
     parser.add_argument("--calibration-polypgen-expected-dice-min", type=float, default=0.78)
     parser.add_argument("--calibration-expected-dice-mid", type=float, default=0.88)
     parser.add_argument("--calibration-expected-dice-mid-scale", type=float, default=0.55)
-    parser.add_argument("--box-localizer-checkpoint", type=str, default="checkpoints/box_localizer_lsmall_smoke_best.pth")
-    parser.add_argument("--box-required-train-mode", type=str, default="supervised_only")
+    parser.add_argument("--box-localizer-checkpoint", type=str, default="checkpoints/student_flywheel_tiered_pilot_best.pth")
+    parser.add_argument("--box-required-train-mode", type=str, default="off")
     parser.add_argument("--box-max-preview", type=int, default=200)
-    parser.add_argument("--box-preview-mode", type=str, default="image_box", choices=["image_box", "image_mask_box", "panel_heatmap"])
+    parser.add_argument("--box-preview-mode", type=str, default="image_mask_box", choices=["image_box", "image_mask_box", "panel_heatmap"])
+    parser.add_argument("--box-review-polypgen-min", type=int, default=70)
+    parser.add_argument("--box-review-high-conf-threshold", type=float, default=0.72)
+    parser.add_argument("--box-review-tiny-area-max", type=float, default=0.01)
+    parser.add_argument("--box-review-reflection-high", type=float, default=0.10)
+    parser.add_argument("--box-review-aspect-max", type=float, default=4.5)
+    parser.add_argument("--box-review-center-bias-min", type=float, default=0.62)
     parser.add_argument("--lora-num-workers", type=int, default=0)
     parser.add_argument("--lora-enable-augment", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--lora-augment-prob", type=float, default=0.85)
     parser.add_argument("--lora-box-jitter-scale", type=float, default=0.30)
     parser.add_argument("--lora-box-jitter-shift", type=float, default=0.25)
     parser.add_argument("--lora-box-full-image-prob", type=float, default=0.03)
+    parser.add_argument("--lora-epochs", type=int, default=30)
+    parser.add_argument("--lora-lr", type=float, default=1e-4)
+    parser.add_argument("--lora-weight-decay", type=float, default=1e-4)
+    parser.add_argument("--lora-encoder-rank", type=int, default=16)
+    parser.add_argument("--lora-encoder-alpha", type=int, default=16)
+    parser.add_argument("--lora-decoder-rank", type=int, default=8)
+    parser.add_argument("--lora-decoder-alpha", type=int, default=8)
+    parser.add_argument("--lora-stage-epochs", type=str, default="10,10,10")
+    parser.add_argument("--lora-stage-lrs", type=str, default="")
+    parser.add_argument("--lora-unfreeze-encoder-tail-fraction", type=float, default=0.35)
+    parser.add_argument("--lora-loss-dice", type=float, default=0.50)
+    parser.add_argument("--lora-loss-focal", type=float, default=0.30)
+    parser.add_argument("--lora-loss-boundary", type=float, default=0.20)
+    parser.add_argument("--lora-focal-alpha", type=float, default=0.25)
+    parser.add_argument("--lora-focal-gamma", type=float, default=2.0)
+    parser.add_argument("--lora-boundary-radius", type=int, default=1)
+    parser.add_argument("--lora-prompt-mode", type=str, default="box_point_mix", choices=["box_only", "point_only", "box_point_mix"])
+    parser.add_argument("--lora-prompt-mix-both-prob", type=float, default=0.60)
+    parser.add_argument("--lora-prompt-mix-box-only-prob", type=float, default=0.20)
+    parser.add_argument("--lora-num-pos-points", type=int, default=1)
+    parser.add_argument("--lora-num-neg-points", type=int, default=1)
+    parser.add_argument("--lora-point-jitter-frac", type=float, default=0.03)
     parser.add_argument("--train-num-workers", type=int, default=0)
     parser.add_argument("--python-exec", type=str, default=sys.executable)
     args = parser.parse_args()
@@ -969,6 +1153,28 @@ def main():
     round1.mkdir(parents=True, exist_ok=True)
     round2.mkdir(parents=True, exist_ok=True)
     lora_common_args = [
+        "--epochs", str(args.lora_epochs),
+        "--lr", str(args.lora_lr),
+        "--weight-decay", str(args.lora_weight_decay),
+        "--encoder-rank", str(args.lora_encoder_rank),
+        "--encoder-alpha", str(args.lora_encoder_alpha),
+        "--decoder-rank", str(args.lora_decoder_rank),
+        "--decoder-alpha", str(args.lora_decoder_alpha),
+        "--stage-epochs", str(args.lora_stage_epochs),
+        "--stage-lrs", str(args.lora_stage_lrs),
+        "--unfreeze-encoder-tail-fraction", str(args.lora_unfreeze_encoder_tail_fraction),
+        "--loss-dice", str(args.lora_loss_dice),
+        "--loss-focal", str(args.lora_loss_focal),
+        "--loss-boundary", str(args.lora_loss_boundary),
+        "--focal-alpha", str(args.lora_focal_alpha),
+        "--focal-gamma", str(args.lora_focal_gamma),
+        "--boundary-radius", str(args.lora_boundary_radius),
+        "--prompt-mode", str(args.lora_prompt_mode),
+        "--prompt-mix-both-prob", str(args.lora_prompt_mix_both_prob),
+        "--prompt-mix-box-only-prob", str(args.lora_prompt_mix_box_only_prob),
+        "--num-pos-points", str(args.lora_num_pos_points),
+        "--num-neg-points", str(args.lora_num_neg_points),
+        "--point-jitter-frac", str(args.lora_point_jitter_frac),
         "--num-workers", str(args.lora_num_workers),
         "--augment-prob", str(args.lora_augment_prob),
         "--box-jitter-scale", str(args.lora_box_jitter_scale),
@@ -977,15 +1183,16 @@ def main():
         "--enable-augment" if bool(args.lora_enable_augment) else "--no-enable-augment",
     ]
 
+    teacher_r0_done_paths = [teacher_r0] if _is_lora_checkpoint_complete(teacher_r0, int(args.lora_epochs)) else []
     _run_if_outputs_missing(
         step_name="teacher_r0_lora",
-        done_paths=[teacher_r0],
+        done_paths=teacher_r0_done_paths,
         cmd=[
             args.python_exec,
             "medsam_tools/finetune_lora.py",
             "--checkpoint", args.base_sam_checkpoint,
             "--data-manifest", args.data_manifest,
-            "--subset-filter", "L_small",
+            "--subset-filter", str(args.teacher_subset_filter),
             "--split-filter", "train,val",
             *lora_common_args,
             "--save-path", str(teacher_r0),
@@ -999,6 +1206,8 @@ def main():
             metrics_path=lora_qc_metrics_path,
             dice_min=float(args.lora_qc_dice_min),
             bf1_min=float(args.lora_qc_bf1_min),
+            polypgen_dice_min=float(args.lora_qc_polypgen_dice_min),
+            polypgen_bf1_min=float(args.lora_qc_polypgen_bf1_min),
         )
         if not reused:
             _run_lora_qc(
@@ -1009,6 +1218,9 @@ def main():
                 teacher_checkpoint=str(teacher_r0),
                 dice_min=float(args.lora_qc_dice_min),
                 bf1_min=float(args.lora_qc_bf1_min),
+                subset_filter=str(args.lora_qc_subset_filter),
+                polypgen_dice_min=float(args.lora_qc_polypgen_dice_min),
+                polypgen_bf1_min=float(args.lora_qc_polypgen_bf1_min),
                 worst_k=int(args.lora_qc_worst_k),
             )
         lora_qc_metrics = str(lora_qc_metrics_path)
@@ -1087,6 +1299,12 @@ def main():
                 "tools/select_box_review_ids.py",
                 "--proposal-csv", str(round1_auto_prop_csv),
                 "--max-review", str(max(box_count, int(args.manual_review_per_round))),
+                "--polypgen-min-quota", str(max(0, int(args.box_review_polypgen_min))),
+                "--high-conf-threshold", str(args.box_review_high_conf_threshold),
+                "--tiny-box-area-max", str(args.box_review_tiny_area_max),
+                "--reflection-high-threshold", str(args.box_review_reflection_high),
+                "--aspect-ratio-max", str(args.box_review_aspect_max),
+                "--center-bias-threshold", str(args.box_review_center_bias_min),
                 "--output-json", str(round1_uncertain_json),
                 "--output-txt", str(round1_manual_dir / "uncertain_box_ids.txt"),
             ],
@@ -1188,6 +1406,11 @@ def main():
         done_paths=[round1 / "pseudo" / "pseudo_quality.csv", round1 / "pseudo" / "pseudo_candidates_manifest.csv"],
         cmd=round1_pseudo_cmd,
     )
+    _pseudo_artifact_guard(
+        quality_csv=str(round1 / "pseudo" / "pseudo_quality.csv"),
+        hard_masks_dir=str(round1 / "pseudo" / "hard_masks"),
+        enabled=True,
+    )
     _round_quality_guard(
         quality_csv=str(round1 / "pseudo" / "pseudo_quality.csv"),
         large_mask_threshold=float(args.large_mask_threshold),
@@ -1281,19 +1504,52 @@ def main():
                 if bool(args.manual_pass_only_for_student):
                     round1_selected_for_student = reviewed_manifest_r1
 
+    # Optional fastlane: if a reviewed tight-good CSV is present, augment round1 refresh manifest.
+    tight_review_csv = round1_manual_dir / "tight_good_seed300_review.csv"
+    if teacher_refresh and tight_review_csv.exists() and round1_selected_for_refresh.exists():
+        tight_keep_ids = _review_non_reject_ids(str(tight_review_csv))
+        if tight_keep_ids:
+            tight_aug_manifest = round1_filter_dir / "selected_manifest_refresh_plus_tight.csv"
+            total_n, added_n = _augment_manifest_with_ids(
+                base_manifest=str(round1_selected_for_refresh),
+                source_manifest=str(round1 / "pseudo" / "pseudo_candidates_manifest.csv"),
+                add_ids=tight_keep_ids,
+                output_manifest=str(tight_aug_manifest),
+            )
+            if added_n > 0:
+                round1_selected_for_refresh = tight_aug_manifest
+            print(
+                "[round1 tight fastlane] "
+                f"review_non_reject={len(tight_keep_ids)} added_to_refresh={added_n} "
+                f"refresh_manifest_rows={total_n} manifest={tight_aug_manifest}"
+            )
+
     teacher_for_round2 = teacher_r0
     if teacher_refresh and round1_selected_for_refresh.exists():
         teacher_train_manifest = round1 / "teacher_round1_manifest.csv"
-        _merge_teacher_manifest(args.data_manifest, str(round1_selected_for_refresh), str(teacher_train_manifest))
+        refresh_keep_subsets = {
+            s.strip()
+            for s in str(args.teacher_refresh_subset_filter).split(",")
+            if s.strip() and not s.strip().lower().startswith("pseudo_")
+        }
+        if not refresh_keep_subsets:
+            refresh_keep_subsets = {"L_small"}
+        _merge_teacher_manifest(
+            args.data_manifest,
+            str(round1_selected_for_refresh),
+            str(teacher_train_manifest),
+            keep_subsets=refresh_keep_subsets,
+        )
+        teacher_r1_done_paths = [teacher_r1] if _is_lora_checkpoint_complete(teacher_r1, int(args.lora_epochs)) else []
         _run_if_outputs_missing(
             step_name="teacher_r1_refresh",
-            done_paths=[teacher_r1],
+            done_paths=teacher_r1_done_paths,
             cmd=[
                 args.python_exec,
                 "medsam_tools/finetune_lora.py",
                 "--checkpoint", args.base_sam_checkpoint,
                 "--data-manifest", str(teacher_train_manifest),
-                "--subset-filter", "L_small,pseudo_round1",
+                "--subset-filter", str(args.teacher_refresh_subset_filter),
                 "--split-filter", "train,val",
                 *lora_common_args,
                 "--init-lora-checkpoint", str(teacher_r0),
@@ -1345,6 +1601,12 @@ def main():
                 "tools/select_box_review_ids.py",
                 "--proposal-csv", str(round2_auto_prop_csv),
                 "--max-review", str(max(box_count, int(args.manual_review_per_round))),
+                "--polypgen-min-quota", str(max(0, int(args.box_review_polypgen_min))),
+                "--high-conf-threshold", str(args.box_review_high_conf_threshold),
+                "--tiny-box-area-max", str(args.box_review_tiny_area_max),
+                "--reflection-high-threshold", str(args.box_review_reflection_high),
+                "--aspect-ratio-max", str(args.box_review_aspect_max),
+                "--center-bias-threshold", str(args.box_review_center_bias_min),
                 "--output-json", str(round2_uncertain_json),
                 "--output-txt", str(round2_manual_dir / "uncertain_box_ids.txt"),
             ],
@@ -1445,6 +1707,11 @@ def main():
         step_name="round2_pseudo_generation",
         done_paths=[round2 / "pseudo" / "pseudo_quality.csv", round2 / "pseudo" / "pseudo_candidates_manifest.csv"],
         cmd=round2_pseudo_cmd,
+    )
+    _pseudo_artifact_guard(
+        quality_csv=str(round2 / "pseudo" / "pseudo_quality.csv"),
+        hard_masks_dir=str(round2 / "pseudo" / "hard_masks"),
+        enabled=True,
     )
     _run_if_outputs_missing(
         step_name="round2_pseudo_filtering",
@@ -1580,11 +1847,32 @@ def main():
         "pseudo_auto_proposal_mode_effective": str(effective_auto_proposal_mode),
         "pseudo_proposal_mix_mode": str(args.pseudo_proposal_mix_mode),
         "pseudo_proposal_mix_mode_effective": str(effective_mix_mode),
+        "teacher_subset_filter": str(args.teacher_subset_filter),
+        "teacher_refresh_subset_filter": str(args.teacher_refresh_subset_filter),
+        "lora_qc_subset_filter": str(args.lora_qc_subset_filter),
+        "lora_qc_polypgen_dice_min": float(args.lora_qc_polypgen_dice_min),
+        "lora_qc_polypgen_bf1_min": float(args.lora_qc_polypgen_bf1_min),
         "lora_enable_augment": bool(args.lora_enable_augment),
+        "lora_epochs": int(args.lora_epochs),
+        "lora_lr": float(args.lora_lr),
+        "lora_weight_decay": float(args.lora_weight_decay),
+        "lora_encoder_rank": int(args.lora_encoder_rank),
+        "lora_encoder_alpha": int(args.lora_encoder_alpha),
+        "lora_decoder_rank": int(args.lora_decoder_rank),
+        "lora_decoder_alpha": int(args.lora_decoder_alpha),
+        "lora_stage_epochs": str(args.lora_stage_epochs),
+        "lora_stage_lrs": str(args.lora_stage_lrs),
+        "lora_prompt_mode": str(args.lora_prompt_mode),
+        "lora_loss_dice": float(args.lora_loss_dice),
+        "lora_loss_focal": float(args.lora_loss_focal),
+        "lora_loss_boundary": float(args.lora_loss_boundary),
         "lora_augment_prob": float(args.lora_augment_prob),
         "lora_box_jitter_scale": float(args.lora_box_jitter_scale),
         "lora_box_jitter_shift": float(args.lora_box_jitter_shift),
         "lora_box_full_image_prob": float(args.lora_box_full_image_prob),
+        "box_localizer_checkpoint": str(args.box_localizer_checkpoint),
+        "box_required_train_mode": str(args.box_required_train_mode),
+        "box_review_polypgen_min": int(args.box_review_polypgen_min),
         "pseudo_proposal_jitter_scales": str(args.pseudo_proposal_jitter_scales),
         "pseudo_proposal_jitter_shifts": str(args.pseudo_proposal_jitter_shifts),
         "pseudo_score_weight_center_prior_polypgen": float(args.pseudo_score_weight_center_prior_polypgen),

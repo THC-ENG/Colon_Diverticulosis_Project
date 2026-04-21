@@ -59,16 +59,20 @@ class ManualBoxReviewer:
         output_csv: Path,
         max_w: int,
         max_h: int,
+        panel_dir: Path | None = None,
     ):
         self.rows = rows
         self.fieldnames = fieldnames
         self.output_csv = output_csv
         self.max_w = int(max_w)
         self.max_h = int(max_h)
+        self.panel_dir = panel_dir
         self.index = 0
         self.window = "Manual Box Review"
+        self.panel_window = "Panel Reference"
 
         self.current_image = None
+        self.current_panel = None
         self.current_shape = (1, 1)
         self.scale = 1.0
 
@@ -89,6 +93,27 @@ class ManualBoxReviewer:
 
         cv2.namedWindow(self.window, cv2.WINDOW_NORMAL)
         cv2.setMouseCallback(self.window, self._on_mouse)
+        if self.panel_dir is not None:
+            cv2.namedWindow(self.panel_window, cv2.WINDOW_NORMAL)
+
+    def _find_panel_image(self, rid: str) -> np.ndarray | None:
+        if self.panel_dir is None:
+            return None
+        base = str(rid or "").strip()
+        if not base:
+            return None
+        candidates = [
+            self.panel_dir / f"{base}.jpg",
+            self.panel_dir / f"{base}.png",
+            self.panel_dir / f"{base}.jpeg",
+            self.panel_dir / f"{base}.webp",
+        ]
+        for p in candidates:
+            if p.exists():
+                img = cv2.imread(str(p), cv2.IMREAD_COLOR)
+                if img is not None:
+                    return img
+        return None
 
     def _on_mouse(self, event, x, y, flags, param):
         if self.current_image is None:
@@ -163,6 +188,8 @@ class ManualBoxReviewer:
         h, w = image.shape[:2]
         self.current_shape = (w, h)
         self.current_image = image
+        rid = str(row.get("id", "")).strip()
+        self.current_panel = self._find_panel_image(rid)
         self.drawn_box = None
         self.drag_start = None
         self.drag_end = None
@@ -215,6 +242,26 @@ class ManualBoxReviewer:
         cv2.putText(disp, text3, (12, max(24, disp.shape[0] - 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (240, 240, 240), 1, cv2.LINE_AA)
 
         cv2.imshow(self.window, disp)
+        if self.panel_dir is not None:
+            panel = self.current_panel
+            if panel is None:
+                panel = np.zeros((480, 720, 3), dtype=np.uint8)
+                cv2.putText(panel, "Panel Not Found", (24, 56), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 2, cv2.LINE_AA)
+            ph, pw = panel.shape[:2]
+            ps = min(float(self.max_w) / float(max(1, pw)), float(self.max_h) / float(max(1, ph)), 1.0)
+            ps = max(1e-6, ps)
+            panel_disp = cv2.resize(panel, (int(round(pw * ps)), int(round(ph * ps))), interpolation=cv2.INTER_LINEAR)
+            cv2.putText(
+                panel_disp,
+                "Reference: panel_heatmap / prob",
+                (12, 28),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.62,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.imshow(self.panel_window, panel_disp)
 
     def run(self):
         if not self.rows:
@@ -305,6 +352,7 @@ def main():
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--max-display-width", type=int, default=1600)
     parser.add_argument("--max-display-height", type=int, default=950)
+    parser.add_argument("--panel-dir", type=str, default="", help="Optional panel/heatmap preview directory keyed by id.jpg")
     args = parser.parse_args()
 
     template_csv = Path(args.template_csv)
@@ -322,6 +370,7 @@ def main():
         output_csv=output_csv,
         max_w=args.max_display_width,
         max_h=args.max_display_height,
+        panel_dir=Path(args.panel_dir) if str(args.panel_dir).strip() else None,
     )
     reviewer.index = max(0, min(len(rows) - 1, int(args.start_index)))
     reviewer.run()
