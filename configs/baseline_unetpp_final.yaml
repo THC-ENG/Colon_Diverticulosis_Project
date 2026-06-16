@@ -1,0 +1,29 @@
+model: unetpp
+base_channels: 32
+norm_type: gn
+
+data_manifest: runs/flywheel_full_manual_bridge_1500/student_manifest_final_sdf_smooth.csv
+data_root: data/joint_polyp_v1
+manifest_mode: only
+mask_threshold: 127
+
+epochs: 100
+batch_size: 4
+lr: 0.0001
+weight_decay: 0.0001
+warmup_epochs: 5
+grad_clip_norm: 1.0
+img_size: 256
+num_workers: 2
+seed: 42
+device: cuda
+amp: true
+save_path: checkpoints/baselines/unetpp_final_sdf_smooth.pth
+run_name: baseline_unetpp_final_sdf_smooth
+
+seg_focal_weight: 0.7
+seg_dice_weight: 0.3
+focal_alpha: 0.25
+focal_gamma: 2.0
+use_pseudo_weight: true
+pseudo_weight_min: 0.05

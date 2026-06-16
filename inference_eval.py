@@ -75,6 +75,27 @@ def _to_mask_np(mask_tensor: torch.Tensor) -> np.ndarray:
     return (mask_tensor.squeeze().detach().cpu().numpy() > 0.5).astype(np.uint8)
 
 
+def _binary_mask_stats(pred_mask: np.ndarray, gt_mask: np.ndarray, eps: float = 1e-6) -> dict:
+    pred = (pred_mask > 0).astype(np.uint8).reshape(-1)
+    gt = (gt_mask > 0).astype(np.uint8).reshape(-1)
+
+    tp = float((pred * gt).sum())
+    pred_sum = float(pred.sum())
+    gt_sum = float(gt.sum())
+    fp = pred_sum - tp
+    fn = gt_sum - tp
+
+    both_empty = pred_sum == 0.0 and gt_sum == 0.0
+    precision = 1.0 if both_empty else float((tp + eps) / (tp + fp + eps))
+    recall = 1.0 if both_empty else float((tp + eps) / (tp + fn + eps))
+    mae = float(np.mean(np.abs(pred.astype(np.float32) - gt.astype(np.float32))))
+    return {
+        "precision": precision,
+        "recall": recall,
+        "mae": mae,
+    }
+
+
 def save_comparison_grid(
     image_tensor: torch.Tensor,
     gt_tensor: torch.Tensor,
@@ -412,6 +433,9 @@ def main():
 
     dice_values = []
     iou_values = []
+    precision_values = []
+    recall_values = []
+    mae_values = []
     boundary_f1_values = []
     hd95_values = []
     sample_rows = []
@@ -461,10 +485,17 @@ def main():
 
                 pred_mask_np = (seg_probs[j].squeeze().cpu().numpy() > threshold_used).astype(np.uint8)
                 gt_mask_np = _to_mask_np(masks[j])
+                mask_stats = _binary_mask_stats(pred_mask_np, gt_mask_np)
+                precision_values.append(mask_stats["precision"])
+                recall_values.append(mask_stats["recall"])
+                mae_values.append(mask_stats["mae"])
                 row = {
                     "id": sample_id,
                     "dice": float(d[j].item()),
                     "iou": float(i[j].item()),
+                    "precision": float(mask_stats["precision"]),
+                    "recall": float(mask_stats["recall"]),
+                    "mae": float(mask_stats["mae"]),
                     "source": str(sources[j]) if j < len(sources) else "",
                     "subset": str(subsets[j]) if j < len(subsets) else "",
                     "round_id": int(round_ids[j]) if j < len(round_ids) else 0,
@@ -485,9 +516,20 @@ def main():
 
                 gk = f"{row['source']}|{row['subset']}|r{row['round_id']}"
                 if gk not in grouped:
-                    grouped[gk] = {"dice": [], "iou": [], "boundary_f1": [], "hd95": []}
+                    grouped[gk] = {
+                        "dice": [],
+                        "iou": [],
+                        "precision": [],
+                        "recall": [],
+                        "mae": [],
+                        "boundary_f1": [],
+                        "hd95": [],
+                    }
                 grouped[gk]["dice"].append(row["dice"])
                 grouped[gk]["iou"].append(row["iou"])
+                grouped[gk]["precision"].append(row["precision"])
+                grouped[gk]["recall"].append(row["recall"])
+                grouped[gk]["mae"].append(row["mae"])
                 if "boundary_f1" in row:
                     grouped[gk]["boundary_f1"].append(row["boundary_f1"])
                 if "hd95" in row:
@@ -508,6 +550,12 @@ def main():
         "dice_std": float(np.std(dice_values)) if dice_values else 0.0,
         "iou_mean": float(np.mean(iou_values)) if iou_values else 0.0,
         "iou_std": float(np.std(iou_values)) if iou_values else 0.0,
+        "precision_mean": float(np.mean(precision_values)) if precision_values else 0.0,
+        "precision_std": float(np.std(precision_values)) if precision_values else 0.0,
+        "recall_mean": float(np.mean(recall_values)) if recall_values else 0.0,
+        "recall_std": float(np.std(recall_values)) if recall_values else 0.0,
+        "mae_mean": float(np.mean(mae_values)) if mae_values else 0.0,
+        "mae_std": float(np.std(mae_values)) if mae_values else 0.0,
     }
 
     if args.report_boundary_metrics:
@@ -522,6 +570,9 @@ def main():
             "n": len(vals["dice"]),
             "dice_mean": float(np.mean(vals["dice"])) if vals["dice"] else 0.0,
             "iou_mean": float(np.mean(vals["iou"])) if vals["iou"] else 0.0,
+            "precision_mean": float(np.mean(vals["precision"])) if vals["precision"] else 0.0,
+            "recall_mean": float(np.mean(vals["recall"])) if vals["recall"] else 0.0,
+            "mae_mean": float(np.mean(vals["mae"])) if vals["mae"] else 0.0,
             "boundary_f1_mean": float(np.mean(vals["boundary_f1"])) if vals["boundary_f1"] else 0.0,
             "hd95_mean": float(np.mean(vals["hd95"])) if vals["hd95"] else 0.0,
         }
