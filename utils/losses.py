@@ -124,28 +124,44 @@ def _reduce_per_sample(x: torch.Tensor) -> torch.Tensor:
     return x.view(x.shape[0], -1).mean(dim=1)
 
 
+def _weighted_reduce_per_sample(x: torch.Tensor, pixel_weight: torch.Tensor | None) -> torch.Tensor:
+    if pixel_weight is None:
+        return _reduce_per_sample(x)
+    w = torch.clamp(pixel_weight, min=0.0)
+    num = (x * w).view(x.shape[0], -1).sum(dim=1)
+    den = w.view(w.shape[0], -1).sum(dim=1).clamp(min=1e-6)
+    return num / den
+
+
 def _focal_per_sample(
     logits: torch.Tensor,
     targets: torch.Tensor,
     alpha: float = 0.25,
     gamma: float = 2.0,
+    pixel_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
     probs = torch.sigmoid(logits)
     pt = torch.where(targets > 0.5, probs, 1.0 - probs)
     alpha_t = torch.where(targets > 0.5, alpha, 1.0 - alpha)
-    return _reduce_per_sample(alpha_t * (1.0 - pt).pow(gamma) * bce)
+    focal = alpha_t * (1.0 - pt).pow(gamma) * bce
+    return _weighted_reduce_per_sample(focal, pixel_weight)
 
 
 def _dice_per_sample(
     logits: torch.Tensor,
     targets: torch.Tensor,
     smooth: float = 1.0,
+    pixel_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     probs = torch.sigmoid(logits).reshape(logits.shape[0], -1)
     t = targets.reshape(targets.shape[0], -1)
-    inter = (probs * t).sum(dim=1)
-    denom = probs.sum(dim=1) + t.sum(dim=1)
+    if pixel_weight is None:
+        w = torch.ones_like(targets).reshape(targets.shape[0], -1)
+    else:
+        w = torch.clamp(pixel_weight, min=0.0).reshape(pixel_weight.shape[0], -1)
+    inter = (probs * t * w).sum(dim=1)
+    denom = (probs * w).sum(dim=1) + (t * w).sum(dim=1)
     return 1.0 - (2.0 * inter + smooth) / (denom + smooth)
 
 
@@ -173,6 +189,17 @@ def _safe_weighted_mean(values: torch.Tensor, weights: torch.Tensor) -> torch.Te
     return (values * weights).sum() / denom
 
 
+def _morph_boundary_band(mask_u01: torch.Tensor, radius: int) -> torch.Tensor:
+    if int(radius) <= 0:
+        return torch.zeros_like(mask_u01)
+    r = int(max(1, radius))
+    k = 2 * r + 1
+    dil = F.max_pool2d(mask_u01, kernel_size=k, stride=1, padding=r)
+    ero = -F.max_pool2d(-mask_u01, kernel_size=k, stride=1, padding=r)
+    band = (dil - ero) > 1e-6
+    return band.to(mask_u01.dtype)
+
+
 class StudentCompositeLoss(nn.Module):
     def __init__(
         self,
@@ -186,6 +213,11 @@ class StudentCompositeLoss(nn.Module):
         seg_dice_weight: float = 0.3,
         distill_temperature: float = 2.0,
         schedule_milestones: tuple[float, float, float] = (0.2, 0.6, 0.8),
+        boundary_band_radius: int = 2,
+        pseudo_boundary_band_weight: float = 0.35,
+        gt_boundary_band_boost: float = 1.25,
+        pseudo_edge_scale: float = 0.6,
+        gt_edge_scale: float = 1.2,
     ):
         super().__init__()
         self.lambda_sup = float(lambda_sup)
@@ -197,6 +229,11 @@ class StudentCompositeLoss(nn.Module):
         self.seg_focal_weight = float(seg_focal_weight)
         self.seg_dice_weight = float(seg_dice_weight)
         self.distill_temperature = float(distill_temperature)
+        self.boundary_band_radius = int(max(0, boundary_band_radius))
+        self.pseudo_boundary_band_weight = float(max(0.0, pseudo_boundary_band_weight))
+        self.gt_boundary_band_boost = float(max(0.0, gt_boundary_band_boost))
+        self.pseudo_edge_scale = float(max(0.0, pseudo_edge_scale))
+        self.gt_edge_scale = float(max(0.0, gt_edge_scale))
         self.m1, self.m2, self.m3 = schedule_milestones
 
     def _weights_for_ratio(self, epoch_ratio: float) -> tuple[float, float, float, float]:
@@ -226,18 +263,39 @@ class StudentCompositeLoss(nn.Module):
     ) -> tuple[torch.Tensor, dict]:
         lw_sup, lw_pseudo, lw_edge, lw_distill = self._weights_for_ratio(epoch_ratio)
 
+        sup_sel = (is_labeled > 0.5) & (is_pseudo < 0.5)
+        pseudo_sel = is_pseudo > 0.5
+        pseudo_w = torch.clamp(pseudo_weight, min=0.0)
+
+        masks_u01 = (masks > 0.5).to(masks.dtype)
+        boundary_band = _morph_boundary_band(masks_u01, radius=int(self.boundary_band_radius))
+        pixel_weight = torch.ones_like(masks_u01)
+        if int(self.boundary_band_radius) > 0:
+            is_pseudo_map = pseudo_sel.view(-1, 1, 1, 1)
+            is_sup_map = sup_sel.view(-1, 1, 1, 1)
+            band_pos = boundary_band > 0.5
+            if bool(is_pseudo_map.any()):
+                pixel_weight = torch.where(
+                    is_pseudo_map & band_pos,
+                    torch.full_like(pixel_weight, float(self.pseudo_boundary_band_weight)),
+                    pixel_weight,
+                )
+            if bool(is_sup_map.any()):
+                pixel_weight = torch.where(
+                    is_sup_map & band_pos,
+                    torch.full_like(pixel_weight, float(self.gt_boundary_band_boost)),
+                    pixel_weight,
+                )
+
         focal_ps = _focal_per_sample(
             seg_logits,
             masks,
             alpha=self.focal_alpha,
             gamma=self.focal_gamma,
+            pixel_weight=pixel_weight,
         )
-        dice_ps = _dice_per_sample(seg_logits, masks)
+        dice_ps = _dice_per_sample(seg_logits, masks, pixel_weight=pixel_weight)
         seg_ps = self.seg_focal_weight * focal_ps + self.seg_dice_weight * dice_ps
-
-        sup_sel = (is_labeled > 0.5) & (is_pseudo < 0.5)
-        pseudo_sel = is_pseudo > 0.5
-        pseudo_w = torch.clamp(pseudo_weight, min=0.0)
 
         l_sup = torch.zeros((), dtype=seg_logits.dtype, device=seg_logits.device)
         if sup_sel.any():
@@ -252,8 +310,12 @@ class StudentCompositeLoss(nn.Module):
         target_edge = _sobel_edge_map(masks)
         edge_ps = _reduce_per_sample(F.l1_loss(pred_edge, target_edge, reduction="none"))
 
-        edge_sel = (is_labeled > 0.5) | (is_pseudo > 0.5)
-        edge_w = torch.where(is_pseudo > 0.5, torch.clamp(pseudo_w, min=1e-6), torch.ones_like(pseudo_w))
+        edge_sel = sup_sel | pseudo_sel
+        edge_w = torch.where(
+            pseudo_sel,
+            torch.clamp(pseudo_w, min=1e-6) * float(self.pseudo_edge_scale),
+            torch.ones_like(pseudo_w) * float(self.gt_edge_scale),
+        )
         l_edge = torch.zeros((), dtype=seg_logits.dtype, device=seg_logits.device)
         if edge_sel.any():
             l_edge = _safe_weighted_mean(edge_ps[edge_sel], edge_w[edge_sel])
@@ -291,5 +353,10 @@ class StudentCompositeLoss(nn.Module):
             "lambda_distill": torch.tensor(lw_distill, device=seg_logits.device),
             "seg_focal": focal_ps.mean().detach(),
             "seg_dice": dice_ps.mean().detach(),
+            "boundary_band_radius": torch.tensor(float(self.boundary_band_radius), device=seg_logits.device),
+            "pseudo_boundary_band_weight": torch.tensor(float(self.pseudo_boundary_band_weight), device=seg_logits.device),
+            "gt_boundary_band_boost": torch.tensor(float(self.gt_boundary_band_boost), device=seg_logits.device),
+            "pseudo_edge_scale": torch.tensor(float(self.pseudo_edge_scale), device=seg_logits.device),
+            "gt_edge_scale": torch.tensor(float(self.gt_edge_scale), device=seg_logits.device),
         }
         return total, stats

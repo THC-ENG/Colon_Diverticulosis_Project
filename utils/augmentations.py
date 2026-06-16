@@ -12,6 +12,20 @@ def _resize_pair(image: np.ndarray, mask: np.ndarray, size: Tuple[int, int]) -> 
     return image, mask
 
 
+def _resize_float_map(map_arr: np.ndarray | None, size: Tuple[int, int]) -> np.ndarray | None:
+    if map_arr is None:
+        return None
+    h, w = size
+    out = cv2.resize(map_arr.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+    return np.clip(out, 0.0, 1.0).astype(np.float32)
+
+
+def _flip_float_map(map_arr: np.ndarray | None, flip_code: int) -> np.ndarray | None:
+    if map_arr is None:
+        return None
+    return cv2.flip(map_arr, flip_code).astype(np.float32)
+
+
 def _is_polypgen_source(source: str) -> bool:
     return "polypgen" in str(source or "").strip().lower()
 
@@ -232,6 +246,8 @@ class ValAugmentor:
 
 
 class DistillTrainAugmentor:
+    supports_distill_maps = True
+
     def __init__(
         self,
         out_size: Tuple[int, int] = (256, 256),
@@ -256,13 +272,24 @@ class DistillTrainAugmentor:
         self.polypgen_gamma_range = polypgen_gamma_range
         self.polypgen_clahe_prob = polypgen_clahe_prob
 
-    def __call__(self, image: np.ndarray, mask: np.ndarray, source: str = "") -> Tuple[np.ndarray, np.ndarray]:
+    def __call__(
+        self,
+        image: np.ndarray,
+        mask: np.ndarray,
+        source: str = "",
+        distill_soft: np.ndarray | None = None,
+        distill_edge: np.ndarray | None = None,
+    ):
         if random.random() < self.hflip_prob:
             image = cv2.flip(image, 1)
             mask = cv2.flip(mask, 1)
+            distill_soft = _flip_float_map(distill_soft, 1)
+            distill_edge = _flip_float_map(distill_edge, 1)
         if random.random() < self.vflip_prob:
             image = cv2.flip(image, 0)
             mask = cv2.flip(mask, 0)
+            distill_soft = _flip_float_map(distill_soft, 0)
+            distill_edge = _flip_float_map(distill_edge, 0)
 
         alpha = random.uniform(0.92, 1.08)
         beta = random.uniform(-10.0, 10.0)
@@ -282,4 +309,9 @@ class DistillTrainAugmentor:
             image = cv2.GaussianBlur(image, (3, 3), sigmaX=0)
 
         mask = ((mask > 0).astype(np.uint8) * 255)
-        return _resize_pair(image, mask, self.out_size)
+        image, mask = _resize_pair(image, mask, self.out_size)
+        if distill_soft is None and distill_edge is None:
+            return image, mask
+        distill_soft = _resize_float_map(distill_soft, self.out_size)
+        distill_edge = _resize_float_map(distill_edge, self.out_size)
+        return image, mask, distill_soft, distill_edge

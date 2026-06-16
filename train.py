@@ -144,6 +144,11 @@ def _build_parser():
     p.add_argument("--lambda-pseudo", type=float, default=cfg.get("lambda_pseudo", 0.4))
     p.add_argument("--lambda-edge", type=float, default=cfg.get("lambda_edge", 0.2))
     p.add_argument("--lambda-distill", type=float, default=cfg.get("lambda_distill", 0.2))
+    p.add_argument("--boundary-band-radius", type=int, default=cfg.get("boundary_band_radius", 2))
+    p.add_argument("--pseudo-boundary-band-weight", type=float, default=cfg.get("pseudo_boundary_band_weight", 0.35))
+    p.add_argument("--gt-boundary-band-boost", type=float, default=cfg.get("gt_boundary_band_boost", 1.25))
+    p.add_argument("--pseudo-edge-scale", type=float, default=cfg.get("pseudo_edge_scale", 0.6))
+    p.add_argument("--gt-edge-scale", type=float, default=cfg.get("gt_edge_scale", 1.2))
     p.add_argument("--schedule-milestones", type=str, default=cfg.get("schedule_milestones", "0.2,0.6,0.8"))
 
     p.add_argument("--base-sam-checkpoint", type=str, default=cfg.get("base_sam_checkpoint", ""))
@@ -314,12 +319,28 @@ def _build_data(args):
         val_tf = ValAugmentor((args.img_size, args.img_size))
         n_lsmall = sum(1 for s in train_rows if s.subset == "L_small" and s.is_pseudo == 0)
         n_pseudo = sum(1 for s in train_rows if s.is_pseudo == 1)
+        n_pseudo_soft = sum(
+            1 for s in train_rows
+            if s.is_pseudo == 1 and s.soft_path and Path(s.soft_path).exists()
+        )
+        n_pseudo_edge = sum(
+            1 for s in train_rows
+            if s.is_pseudo == 1 and s.edge_path and Path(s.edge_path).exists()
+        )
         pseudo_ratio = float(n_pseudo) / float(max(1, n_lsmall + n_pseudo))
         print(
             "[protocol split] "
             f"train_lsmall={n_lsmall} train_pseudo={n_pseudo} "
             f"pseudo_ratio={pseudo_ratio:.3f} val={len(val_rows)}"
         )
+        print(
+            "[protocol distill] "
+            f"pseudo_with_soft={n_pseudo_soft}/{n_pseudo} "
+            f"pseudo_with_edge={n_pseudo_edge}/{n_pseudo}"
+        )
+        if args.mode == "student_with_pseudo_distill" and args.use_distill and n_pseudo > 0:
+            if n_pseudo_soft == 0 or n_pseudo_edge == 0:
+                print("[warn] distillation is enabled but pseudo soft/edge signals are missing for training rows.")
         train_ds = ProtocolSegDataset(train_rows, transform=train_tf, mask_threshold=args.mask_threshold)
         val_ds = ProtocolSegDataset(val_rows, transform=val_tf, mask_threshold=args.mask_threshold)
         train_sampler, sampler_stats = _build_protocol_sampler(train_rows, args)
@@ -369,7 +390,27 @@ def _run_epoch(model, loader, criterion, aux_criterion, optimizer, scaler, args,
     model.train(train)
     amp_enabled = scaler.is_enabled() if scaler is not None else False
     t = {"total": 0.0, "dice": 0.0, "iou": 0.0, "aux_total": 0.0}
-    for k in ["loss_sup", "loss_pseudo", "loss_edge", "loss_distill", "loss_distill_soft", "loss_distill_edge", "lambda_sup", "lambda_pseudo", "lambda_edge", "lambda_distill", "seg_focal", "seg_dice", "seg_focal_raw", "seg_dice_raw"]:
+    for k in [
+        "loss_sup",
+        "loss_pseudo",
+        "loss_edge",
+        "loss_distill",
+        "loss_distill_soft",
+        "loss_distill_edge",
+        "lambda_sup",
+        "lambda_pseudo",
+        "lambda_edge",
+        "lambda_distill",
+        "seg_focal",
+        "seg_dice",
+        "seg_focal_raw",
+        "seg_dice_raw",
+        "boundary_band_radius",
+        "pseudo_boundary_band_weight",
+        "gt_boundary_band_boost",
+        "pseudo_edge_scale",
+        "gt_edge_scale",
+    ]:
         t[k] = 0.0
     n = 0
     ratio = float(epoch_idx) / float(max(1, args.epochs - 1))
@@ -457,7 +498,25 @@ def _run_epoch(model, loader, criterion, aux_criterion, optimizer, scaler, args,
         t["aux_total"] += aux_total.detach().item() * bs
         t["dice"] += dice_per_sample(seg_logits.detach(), masks, threshold=0.5).sum().item()
         t["iou"] += iou_per_sample(seg_logits.detach(), masks, threshold=0.5).sum().item()
-        for k in ["loss_sup", "loss_pseudo", "loss_edge", "loss_distill", "loss_distill_soft", "loss_distill_edge", "lambda_sup", "lambda_pseudo", "lambda_edge", "lambda_distill", "seg_focal", "seg_dice"]:
+        for k in [
+            "loss_sup",
+            "loss_pseudo",
+            "loss_edge",
+            "loss_distill",
+            "loss_distill_soft",
+            "loss_distill_edge",
+            "lambda_sup",
+            "lambda_pseudo",
+            "lambda_edge",
+            "lambda_distill",
+            "seg_focal",
+            "seg_dice",
+            "boundary_band_radius",
+            "pseudo_boundary_band_weight",
+            "gt_boundary_band_boost",
+            "pseudo_edge_scale",
+            "gt_edge_scale",
+        ]:
             if k in stats:
                 t[k] += stats[k].detach().item() * bs
         n += bs
@@ -537,6 +596,11 @@ def main():
             seg_dice_weight=args.seg_dice_weight,
             distill_temperature=args.distill_temperature,
             schedule_milestones=_parse_schedule(args.schedule_milestones),
+            boundary_band_radius=args.boundary_band_radius,
+            pseudo_boundary_band_weight=args.pseudo_boundary_band_weight,
+            gt_boundary_band_boost=args.gt_boundary_band_boost,
+            pseudo_edge_scale=args.pseudo_edge_scale,
+            gt_edge_scale=args.gt_edge_scale,
         )
     else:
         criterion = DualTaskLoss(
@@ -574,6 +638,15 @@ def main():
 
     best = -1.0
     print(f"[mode] {args.mode} | [protocol] {use_protocol} | train={len(train_ds)} val={len(val_ds)}")
+    if isinstance(criterion, StudentCompositeLoss):
+        print(
+            "[student boundary weighting] "
+            f"boundary_band_radius={args.boundary_band_radius} "
+            f"pseudo_boundary_band_weight={args.pseudo_boundary_band_weight:.4f} "
+            f"gt_boundary_band_boost={args.gt_boundary_band_boost:.4f} "
+            f"pseudo_edge_scale={args.pseudo_edge_scale:.4f} "
+            f"gt_edge_scale={args.gt_edge_scale:.4f}"
+        )
     if sampler_stats:
         print(f"[domain sampler] {json.dumps(sampler_stats, ensure_ascii=False)}")
     for epoch in range(1, args.epochs + 1):
@@ -584,7 +657,24 @@ def main():
         writer.add_scalar("Loss/val_total", va["total"], epoch)
         writer.add_scalar("Metric/train_dice", tr["dice"], epoch)
         writer.add_scalar("Metric/val_dice", va["dice"], epoch)
-        for k in ["loss_sup", "loss_pseudo", "loss_edge", "loss_distill", "lambda_sup", "lambda_pseudo", "lambda_edge", "lambda_distill", "aux_total"]:
+        for k in [
+            "loss_sup",
+            "loss_pseudo",
+            "loss_edge",
+            "loss_distill",
+            "loss_distill_soft",
+            "loss_distill_edge",
+            "lambda_sup",
+            "lambda_pseudo",
+            "lambda_edge",
+            "lambda_distill",
+            "aux_total",
+            "boundary_band_radius",
+            "pseudo_boundary_band_weight",
+            "gt_boundary_band_boost",
+            "pseudo_edge_scale",
+            "gt_edge_scale",
+        ]:
             writer.add_scalar(f"Loss/train_{k}", tr[k], epoch)
             writer.add_scalar(f"Loss/val_{k}", va[k], epoch)
         if va["dice"] > best:

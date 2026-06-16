@@ -123,6 +123,13 @@ def _load_float_map(path: str) -> np.ndarray:
     return np.clip(arr, 0.0, 1.0)
 
 
+def _resize_float_map_to_shape(map_arr: np.ndarray, shape_hw: tuple[int, int]) -> np.ndarray:
+    h, w = shape_hw
+    if map_arr.shape != (h, w):
+        map_arr = cv2.resize(map_arr, (w, h), interpolation=cv2.INTER_LINEAR)
+    return np.clip(map_arr, 0.0, 1.0).astype(np.float32)
+
+
 class ProtocolSegDataset(Dataset):
     IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
     IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -159,33 +166,42 @@ class ProtocolSegDataset(Dataset):
         else:
             mask = np.zeros(image.shape[:2], dtype=np.uint8)
 
-        if self.transform is not None:
-            try:
-                image, mask = self.transform(image, mask, source=row.source)
-            except TypeError:
-                image, mask = self.transform(image, mask)
-
-        mask_bin = (mask > self.mask_threshold).astype(np.uint8)
-        h, w = mask_bin.shape
-
-        distill_soft = np.zeros((h, w), dtype=np.float32)
-        distill_edge = np.zeros((h, w), dtype=np.float32)
+        src_h, src_w = mask.shape
+        distill_soft = np.zeros((src_h, src_w), dtype=np.float32)
+        distill_edge = np.zeros((src_h, src_w), dtype=np.float32)
         has_distill_soft = 0.0
         has_distill_edge = 0.0
 
         if row.soft_path and Path(row.soft_path).exists():
-            soft = _load_float_map(row.soft_path)
-            if soft.shape != (h, w):
-                soft = cv2.resize(soft, (w, h), interpolation=cv2.INTER_LINEAR)
-            distill_soft = np.clip(soft, 0.0, 1.0).astype(np.float32)
+            distill_soft = _resize_float_map_to_shape(_load_float_map(row.soft_path), (src_h, src_w))
             has_distill_soft = 1.0
 
         if row.edge_path and Path(row.edge_path).exists():
-            edge = _load_float_map(row.edge_path)
-            if edge.shape != (h, w):
-                edge = cv2.resize(edge, (w, h), interpolation=cv2.INTER_LINEAR)
-            distill_edge = np.clip(edge, 0.0, 1.0).astype(np.float32)
+            distill_edge = _resize_float_map_to_shape(_load_float_map(row.edge_path), (src_h, src_w))
             has_distill_edge = 1.0
+
+        if self.transform is not None:
+            if getattr(self.transform, "supports_distill_maps", False):
+                image, mask, distill_soft, distill_edge = self.transform(
+                    image,
+                    mask,
+                    source=row.source,
+                    distill_soft=distill_soft,
+                    distill_edge=distill_edge,
+                )
+            else:
+                try:
+                    image, mask = self.transform(image, mask, source=row.source)
+                except TypeError:
+                    image, mask = self.transform(image, mask)
+                h_t, w_t = mask.shape
+                distill_soft = _resize_float_map_to_shape(distill_soft, (h_t, w_t))
+                distill_edge = _resize_float_map_to_shape(distill_edge, (h_t, w_t))
+
+        mask_bin = (mask > self.mask_threshold).astype(np.uint8)
+        h, w = mask_bin.shape
+        distill_soft = _resize_float_map_to_shape(distill_soft, (h, w))
+        distill_edge = _resize_float_map_to_shape(distill_edge, (h, w))
 
         image_f = image.astype(np.float32) / 255.0
         image_f = (image_f - self.IMAGENET_MEAN) / self.IMAGENET_STD
