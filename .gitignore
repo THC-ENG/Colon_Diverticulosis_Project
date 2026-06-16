@@ -82,3 +82,8 @@ pytest_cache/
 *.tmp
 # Local helper deps for plotting scripts
 .deps/
+
+# ========== Local-only external/reference material ==========
+external_models/
+_trash_to_review/
+paper/
