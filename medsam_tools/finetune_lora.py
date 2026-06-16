@@ -14,7 +14,9 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from segment_anything import sam_model_registry
+from medsam_binding import load_sam_components
+
+_, sam_model_registry, SAM_BACKEND_INFO = load_sam_components(caller="finetune_lora.py")
 
 
 def set_seed(seed: int):
@@ -576,6 +578,11 @@ def main():
     parser.add_argument("--focal-gamma", type=float, default=2.0)
     parser.add_argument("--boundary-radius", type=int, default=1)
     args = parser.parse_args()
+    print(
+        "[sam backend] "
+        f"medsam={SAM_BACKEND_INFO['medsam_version']} "
+        f"segment_anything_file={SAM_BACKEND_INFO['segment_anything_file']}"
+    )
 
     set_seed(args.seed)
     os.makedirs(Path(args.save_path).parent, exist_ok=True)
@@ -608,7 +615,13 @@ def main():
         loss_w_dice, loss_w_focal, loss_w_boundary = 1.0, 0.0, 0.0
         print("[loss weights] all non-positive, fallback to Dice-only.")
 
-    sam = sam_model_registry[args.model_type](checkpoint=None).to(args.device)
+    try:
+        sam = sam_model_registry[args.model_type](checkpoint=None).to(args.device)
+    except Exception as exc:
+        # Some MedSAM/SAM backends require a concrete checkpoint path at build time.
+        # Fall back to the user-provided base checkpoint for backend compatibility.
+        print(f"[sam init fallback] checkpoint=None failed ({exc}); retry with checkpoint={args.checkpoint}")
+        sam = sam_model_registry[args.model_type](checkpoint=args.checkpoint).to(args.device)
     base_state = _safe_torch_load(args.checkpoint, map_location=args.device)
     if isinstance(base_state, dict) and "state_dict" in base_state and isinstance(base_state["state_dict"], dict):
         base_state = base_state["state_dict"]

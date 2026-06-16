@@ -5,7 +5,10 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
-from segment_anything import SamPredictor, sam_model_registry
+
+from medsam_binding import load_sam_components
+
+SamPredictor, sam_model_registry, SAM_BACKEND_INFO = load_sam_components(caller="auto_annotate.py")
 
 
 def parse_args():
@@ -32,6 +35,11 @@ def draw_preview(image_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
 
 def main():
     args = parse_args()
+    print(
+        "[sam backend] "
+        f"medsam={SAM_BACKEND_INFO['medsam_version']} "
+        f"segment_anything_file={SAM_BACKEND_INFO['segment_anything_file']}"
+    )
     image_dir = Path(args.image_dir)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

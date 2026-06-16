@@ -9,8 +9,11 @@ import cv2
 import numpy as np
 import torch
 import torch.nn as nn
-from segment_anything import SamPredictor, sam_model_registry
 from tqdm import tqdm
+
+from medsam_binding import load_sam_components
+
+SamPredictor, sam_model_registry, SAM_BACKEND_INFO = load_sam_components(caller="generate_pseudo_labels.py")
 
 
 def _resolve(path_text: str, base: Path | None = None) -> Path:
@@ -1136,6 +1139,11 @@ def main():
     parser.add_argument("--overlay-alpha", type=float, default=0.45)
     parser.add_argument("--write-gallery", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
+    print(
+        "[sam backend] "
+        f"medsam={SAM_BACKEND_INFO['medsam_version']} "
+        f"segment_anything_file={SAM_BACKEND_INFO['segment_anything_file']}"
+    )
 
     out_root = Path(args.output_root)
     hard_dir = out_root / "hard_masks"
@@ -1169,7 +1177,13 @@ def main():
     proposal_jitter_scales = _parse_scales(args.proposal_jitter_scales)
     proposal_jitter_shifts = _parse_offsets(args.proposal_jitter_shifts)
 
-    model = sam_model_registry[args.model_type](checkpoint=None).to(args.device)
+    try:
+        model = sam_model_registry[args.model_type](checkpoint=None).to(args.device)
+    except Exception as exc:
+        # Some MedSAM/SAM backends require a concrete checkpoint path at build time.
+        # Fall back to the user-provided base checkpoint for backend compatibility.
+        print(f"[sam init fallback] checkpoint=None failed ({exc}); retry with checkpoint={args.checkpoint}")
+        model = sam_model_registry[args.model_type](checkpoint=args.checkpoint).to(args.device)
     base_state = _safe_torch_load(args.checkpoint, map_location=args.device)
     if isinstance(base_state, dict) and "state_dict" in base_state and isinstance(base_state["state_dict"], dict):
         base_state = base_state["state_dict"]
