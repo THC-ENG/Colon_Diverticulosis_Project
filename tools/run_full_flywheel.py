@@ -181,6 +181,11 @@ def _merge_teacher_manifest(base_manifest: str, selected_manifest: str, output: 
         "score_source_percentile",
         "pseudo_weight_raw",
         "pseudo_weight_final",
+        "teacher_quality",
+        "student_mean_prob",
+        "student_teacher_iou",
+        "student_edge_agree",
+        "bridge_quality",
     ]
     _write_csv(output, merged, fields)
 
@@ -211,6 +216,11 @@ def _build_student_manifest(base_manifest: str, selected_manifests: list[str], o
         "score_source_percentile",
         "pseudo_weight_raw",
         "pseudo_weight_final",
+        "teacher_quality",
+        "student_mean_prob",
+        "student_teacher_iou",
+        "student_edge_agree",
+        "bridge_quality",
     ]
     _write_csv(output, merged, fields)
 
@@ -278,7 +288,8 @@ def _augment_manifest_with_ids(base_manifest: str, source_manifest: str, add_ids
             continue
         if pid not in add_ids:
             continue
-        out.append(r)
+        norm = {k: r.get(k, "") for k in fields}
+        out.append(norm)
         seen.add(pid)
         added += 1
     _write_csv(output_manifest, out, fields)
@@ -472,6 +483,44 @@ def _resolve_path(raw_path: str, manifest_path: str) -> str:
     return str(cands[0].resolve())
 
 
+def _require_soft_edge_artifacts(manifest_path: str, only_pseudo: bool = True):
+    p = Path(manifest_path)
+    if not p.exists():
+        raise RuntimeError(f"Manifest not found for soft/edge check: {manifest_path}")
+    rows = _read_csv(str(p))
+    if not rows:
+        raise RuntimeError(f"Empty manifest for soft/edge check: {manifest_path}")
+
+    bad = []
+    for r in rows:
+        if only_pseudo and int(_to_float(r.get("is_pseudo", 0), default=0)) != 1:
+            continue
+        pid = str(r.get("id", "")).strip() or "unknown"
+        soft_text = str(r.get("soft_path", "")).strip()
+        edge_text = str(r.get("edge_path", "")).strip()
+        if not soft_text:
+            bad.append((pid, "soft_path_empty"))
+        else:
+            soft_abs = _resolve_path(soft_text, manifest_path)
+            if not Path(soft_abs).exists():
+                bad.append((pid, f"soft_path_missing:{soft_abs}"))
+        if not edge_text:
+            bad.append((pid, "edge_path_empty"))
+        else:
+            edge_abs = _resolve_path(edge_text, manifest_path)
+            if not Path(edge_abs).exists():
+                bad.append((pid, f"edge_path_missing:{edge_abs}"))
+
+    if bad:
+        preview = "\n".join([f"{pid} -> {reason}" for pid, reason in bad[:10]])
+        more = f"\n... and {len(bad) - 10} more" if len(bad) > 10 else ""
+        raise RuntimeError(
+            "Refresh manifest soft/edge artifact check failed.\n"
+            f"Manifest: {manifest_path}\n"
+            f"Issues: {len(bad)}\n{preview}{more}"
+        )
+
+
 def _dice_from_masks(pred, gt) -> float:
     pred = (pred > 0).astype(np.uint8)
     gt = (gt > 0).astype(np.uint8)
@@ -494,6 +543,7 @@ def _run_lora_qc(
     polypgen_dice_min: float,
     polypgen_bf1_min: float,
     worst_k: int,
+    require_explicit_val: bool = False,
 ):
     if cv2 is None or np is None:
         raise RuntimeError("OpenCV (cv2) and numpy are required for --skip-lora-qc=false but are not installed.")
@@ -517,6 +567,11 @@ def _run_lora_qc(
         and str(r.get("mask_path", "")).strip()
     ]
     if not val_rows:
+        if bool(require_explicit_val):
+            raise RuntimeError(
+                "LoRA QC requires explicit val split, but no val rows were found for "
+                f"subsets={sorted(qc_subsets)} in manifest={data_manifest}."
+            )
         val_rows = [
             r
             for r in manifest_rows
@@ -908,13 +963,32 @@ def main():
     parser.add_argument("--student-config", type=str, default="configs/student_joint_training.yaml")
     parser.add_argument("--run-root", type=str, default="runs/flywheel_clean_v1")
     parser.add_argument("--flywheel-rounds", type=int, default=2)
-    parser.add_argument("--round1-keep-quantile", type=float, default=0.35)
+    parser.add_argument("--round1-keep-quantile", type=float, default=0.25)
     parser.add_argument("--round2-keep-quantile", type=float, default=0.15)
     parser.add_argument(
         "--quality-score",
         type=str,
         default="0.35*conf+0.22*edge_quality+0.16*area_prior+0.07*center_prior+0.20*consistency_iou-0.10*spill_ratio-0.08*reflection_overlap",
     )
+    parser.add_argument("--round1-postprocess", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--round1-post-soft-sigma", type=float, default=1.0)
+    parser.add_argument("--round1-post-contour-eps", type=float, default=0.003)
+    parser.add_argument("--round1-post-open-kernel", type=int, default=3)
+    parser.add_argument("--round1-post-close-kernel", type=int, default=5)
+    parser.add_argument("--round1-post-min-component-area-ratio", type=float, default=0.0006)
+    parser.add_argument("--round1-post-keep-max-components", type=int, default=2)
+    parser.add_argument(
+        "--round1-post-quality-score",
+        type=str,
+        default="0.55*quality_post+0.20*edge_quality+0.15*consistency_iou+0.10*boundary_quality",
+    )
+    parser.add_argument("--enable-round1-local-refine", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--local-refine-high-conf", type=float, default=0.78)
+    parser.add_argument("--local-refine-max-disagree", type=float, default=0.25)
+    parser.add_argument("--local-refine-soft-sigma", type=float, default=0.8)
+    parser.add_argument("--local-refine-min-boundary-quality-gain", type=float, default=0.015)
+    parser.add_argument("--local-refine-min-iou-keep", type=float, default=0.85)
+    parser.add_argument("--stop-after-round1-refresh", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--tiered-pseudo", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--tier-low-q", type=float, default=0.45)
     parser.add_argument("--tier-high-q", type=float, default=0.80)
@@ -926,6 +1000,8 @@ def main():
     parser.add_argument("--polypgen-high-weight-scale", type=float, default=0.90)
     parser.add_argument("--round1-proposal-json", type=str, default="")
     parser.add_argument("--round2-proposal-json", type=str, default="")
+    parser.add_argument("--round1-id-filter", type=str, default="")
+    parser.add_argument("--round2-id-filter", type=str, default="")
     parser.add_argument(
         "--pseudo-auto-proposal-mode",
         type=str,
@@ -941,6 +1017,7 @@ def main():
         default="augment_plus_auto",
         choices=["replace", "augment", "augment_plus_auto"],
     )
+    parser.add_argument("--pseudo-fallback-full-image", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--pseudo-proposal-jitter-scales", type=str, default="1.0,0.9,1.15")
     parser.add_argument("--pseudo-proposal-jitter-shifts", type=str, default="0.0,-0.08,0.08")
     parser.add_argument("--pseudo-proposal-jitter-max-boxes", type=int, default=27)
@@ -1025,6 +1102,13 @@ def main():
         default=False,
         help="Use only manual pass mask IDs from each round for final student manifest (small but cleaner pseudo set).",
     )
+    parser.add_argument("--enable-student-bridge", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--student-bridge-config", type=str, default="configs/student_joint_training_pilot_tiered.yaml")
+    parser.add_argument("--student-bridge-epochs", type=int, default=15)
+    parser.add_argument("--student-bridge-min-conf", type=float, default=0.55)
+    parser.add_argument("--student-bridge-min-iou", type=float, default=0.45)
+    parser.add_argument("--student-bridge-min-teacher-quality", type=float, default=0.68)
+    parser.add_argument("--student-bridge-keep-ratio", type=float, default=0.60)
     parser.add_argument("--qa-gate-pass-rate", type=float, default=0.75)
     parser.add_argument("--qa-gate-polypgen-pass-rate", type=float, default=0.70)
     parser.add_argument("--qa-gate-boundary-bad-max", type=float, default=0.15)
@@ -1041,6 +1125,8 @@ def main():
     parser.add_argument("--calibration-polypgen-expected-dice-min", type=float, default=0.78)
     parser.add_argument("--calibration-expected-dice-mid", type=float, default=0.88)
     parser.add_argument("--calibration-expected-dice-mid-scale", type=float, default=0.55)
+    parser.add_argument("--fixed-val-id-list", type=str, default="")
+    parser.add_argument("--require-explicit-val", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--box-localizer-checkpoint", type=str, default="checkpoints/student_flywheel_tiered_pilot_best.pth")
     parser.add_argument("--box-required-train-mode", type=str, default="off")
     parser.add_argument("--box-max-preview", type=int, default=200)
@@ -1110,7 +1196,7 @@ def main():
 
     effective_mix_mode = str(args.pseudo_proposal_mix_mode)
     effective_auto_proposal_mode = str(args.pseudo_auto_proposal_mode)
-    effective_fallback_full_image = True
+    effective_fallback_full_image = bool(args.pseudo_fallback_full_image)
     effective_score_bias_preset = float(args.pseudo_score_bias_preset)
     effective_score_bias_auto = float(args.pseudo_score_bias_auto)
     effective_score_bias_auto_polypgen = float(args.pseudo_score_bias_auto_polypgen)
@@ -1144,6 +1230,56 @@ def main():
     work.mkdir(parents=True, exist_ok=True)
     ckpt_root = work / "checkpoints"
     ckpt_root.mkdir(parents=True, exist_ok=True)
+
+    data_manifest_effective = str(args.data_manifest)
+    val_ids_file = str(args.fixed_val_id_list or "")
+    if bool(args.require_explicit_val):
+        fixed_manifest = work / "manifest_fixed_val.csv"
+        fixed_val_ids = Path(args.fixed_val_id_list) if str(args.fixed_val_id_list).strip() else work / "lsmall_val_ids.txt"
+        _run_if_outputs_missing(
+            step_name="freeze_lsmall_val_split",
+            done_paths=[fixed_manifest, fixed_val_ids],
+            cmd=[
+                args.python_exec,
+                "tools/freeze_lsmall_val_split.py",
+                "--input-manifest",
+                args.data_manifest,
+                "--output-manifest",
+                str(fixed_manifest),
+                "--fixed-val-id-list",
+                str(fixed_val_ids),
+                "--seed",
+                "42",
+                "--val-ratio",
+                "0.2",
+            ],
+        )
+        data_manifest_effective = str(fixed_manifest)
+        val_ids_file = str(fixed_val_ids)
+        fixed_rows = _read_csv(data_manifest_effective)
+        explicit_val_n = sum(
+            1
+            for r in fixed_rows
+            if str(r.get("subset", "")).strip() == "L_small"
+            and str(r.get("split", "")).strip() == "val"
+            and str(r.get("mask_path", "")).strip()
+        )
+        if explicit_val_n <= 0:
+            raise RuntimeError(
+                "Explicit val split required, but no L_small val rows were found after freezing. "
+                f"manifest={data_manifest_effective}"
+            )
+        print(f"[explicit val] enabled rows={explicit_val_n} manifest={data_manifest_effective}")
+
+    round2_localizer_ckpt = Path(args.box_localizer_checkpoint)
+    student_bridge_ckpt_path = ckpt_root / "student_r1_bridge.pth"
+    bridge_ckpt_effective = ""
+    bridge_input_n = 0
+    bridge_kept_n = 0
+    round1_postprocess_quality_csv = ""
+    round1_postprocess_manifest = ""
+    round1_local_refine_manifest = ""
+    round1_local_refine_summary = ""
 
     teacher_r0 = ckpt_root / "teacher_r0.pth"
     teacher_r1 = ckpt_root / "teacher_r1.pth"
@@ -1191,7 +1327,7 @@ def main():
             args.python_exec,
             "medsam_tools/finetune_lora.py",
             "--checkpoint", args.base_sam_checkpoint,
-            "--data-manifest", args.data_manifest,
+            "--data-manifest", data_manifest_effective,
             "--subset-filter", str(args.teacher_subset_filter),
             "--split-filter", "train,val",
             *lora_common_args,
@@ -1213,7 +1349,7 @@ def main():
             _run_lora_qc(
                 python_exec=args.python_exec,
                 work=work,
-                data_manifest=args.data_manifest,
+                data_manifest=data_manifest_effective,
                 base_sam_checkpoint=args.base_sam_checkpoint,
                 teacher_checkpoint=str(teacher_r0),
                 dice_min=float(args.lora_qc_dice_min),
@@ -1222,6 +1358,7 @@ def main():
                 polypgen_dice_min=float(args.lora_qc_polypgen_dice_min),
                 polypgen_bf1_min=float(args.lora_qc_polypgen_bf1_min),
                 worst_k=int(args.lora_qc_worst_k),
+                require_explicit_val=bool(args.require_explicit_val),
             )
         lora_qc_metrics = str(lora_qc_metrics_path)
 
@@ -1260,7 +1397,7 @@ def main():
     round2_filter_dir = round2 / ("filter_tiered" if bool(args.tiered_pseudo) else "filter")
 
     round1_proposal_json_for_pseudo = str(args.round1_proposal_json or "")
-    round1_id_filter_for_pseudo = ""
+    round1_id_filter_for_pseudo = str(args.round1_id_filter or "")
     round1_box_template = round1_manual_dir / "box_review_template.csv"
     round1_mask_template = round1_manual_dir / "mask_review_template.csv"
     round1_box_csv = _resolve_manual_csv(args.manual_box_review_csv_round1, round1_manual_dir / "box_review.csv")
@@ -1280,7 +1417,7 @@ def main():
             cmd=[
                 args.python_exec,
                 "tools/generate_box_prompts.py",
-                "--data-manifest", args.data_manifest,
+                "--data-manifest", data_manifest_effective,
                 "--subset-filter", "U_large",
                 "--localizer-checkpoint", str(localizer_ckpt),
                 "--required-train-mode", str(args.box_required_train_mode),
@@ -1333,12 +1470,16 @@ def main():
         round1_proposal_json_for_pseudo = str(round1_cleaned_prop_json)
         round1_id_filter_for_pseudo = str(round1_id_filter_txt)
 
+    round1_quality_csv_for_filter = round1 / "pseudo" / "pseudo_quality.csv"
+    round1_candidates_manifest_for_filter = round1 / "pseudo" / "pseudo_candidates_manifest.csv"
+    round1_hard_masks_for_guard = round1 / "pseudo" / "hard_masks"
+
     round1_pseudo_cmd = [
         args.python_exec,
         "medsam_tools/generate_pseudo_labels.py",
         "--checkpoint", args.base_sam_checkpoint,
         "--lora-checkpoint", str(teacher_r0),
-        "--data-manifest", args.data_manifest,
+        "--data-manifest", data_manifest_effective,
         "--subset-filter", "U_large",
         "--round-id", "1",
         "--output-root", str(round1 / "pseudo"),
@@ -1406,16 +1547,56 @@ def main():
         done_paths=[round1 / "pseudo" / "pseudo_quality.csv", round1 / "pseudo" / "pseudo_candidates_manifest.csv"],
         cmd=round1_pseudo_cmd,
     )
+
+    if bool(args.round1_postprocess):
+        round1_post_root = round1 / "postprocessed"
+        round1_post_quality = round1_post_root / "pseudo_quality_post.csv"
+        round1_post_manifest = round1_post_root / "pseudo_candidates_manifest_post.csv"
+        _run_if_outputs_missing(
+            step_name="round1_postprocess",
+            done_paths=[round1_post_quality, round1_post_manifest],
+            cmd=[
+                args.python_exec,
+                "tools/postprocess_round1_pseudo.py",
+                "--quality-csv",
+                str(round1 / "pseudo" / "pseudo_quality.csv"),
+                "--candidates-manifest",
+                str(round1 / "pseudo" / "pseudo_candidates_manifest.csv"),
+                "--output-root",
+                str(round1_post_root),
+                "--soft-sigma",
+                str(args.round1_post_soft_sigma),
+                "--contour-eps-ratio",
+                str(args.round1_post_contour_eps),
+                "--open-kernel",
+                str(args.round1_post_open_kernel),
+                "--close-kernel",
+                str(args.round1_post_close_kernel),
+                "--min-component-area-ratio",
+                str(args.round1_post_min_component_area_ratio),
+                "--keep-max-components",
+                str(args.round1_post_keep_max_components),
+            ],
+        )
+        round1_quality_csv_for_filter = round1_post_quality
+        round1_candidates_manifest_for_filter = round1_post_manifest
+        round1_hard_masks_for_guard = round1_post_root / "hard_masks"
+        round1_postprocess_quality_csv = str(round1_post_quality)
+        round1_postprocess_manifest = str(round1_post_manifest)
+
     _pseudo_artifact_guard(
-        quality_csv=str(round1 / "pseudo" / "pseudo_quality.csv"),
-        hard_masks_dir=str(round1 / "pseudo" / "hard_masks"),
+        quality_csv=str(round1_quality_csv_for_filter),
+        hard_masks_dir=str(round1_hard_masks_for_guard),
         enabled=True,
     )
     _round_quality_guard(
-        quality_csv=str(round1 / "pseudo" / "pseudo_quality.csv"),
+        quality_csv=str(round1_quality_csv_for_filter),
         large_mask_threshold=float(args.large_mask_threshold),
         max_large_mask_frac=float(args.max_large_mask_frac),
         enabled=round1_guard,
+    )
+    round1_quality_score_for_filter = (
+        str(args.round1_post_quality_score) if bool(args.round1_postprocess) else str(args.quality_score)
     )
     _run_if_outputs_missing(
         step_name="round1_pseudo_filtering",
@@ -1423,13 +1604,13 @@ def main():
         cmd=[
             args.python_exec,
             "tools/filter_pseudo_labels.py",
-            "--quality-csv", str(round1 / "pseudo" / "pseudo_quality.csv"),
+            "--quality-csv", str(round1_quality_csv_for_filter),
             "--keep-quantile", str(args.round1_keep_quantile),
-            "--quality-score", args.quality_score,
+            "--quality-score", str(round1_quality_score_for_filter),
             "--round-id", "1",
             "--output-dir", str(round1_filter_dir),
-            "--pseudo-candidates-manifest", str(round1 / "pseudo" / "pseudo_candidates_manifest.csv"),
-            "--base-manifest", args.data_manifest,
+            "--pseudo-candidates-manifest", str(round1_candidates_manifest_for_filter),
+            "--base-manifest", data_manifest_effective,
             "--calibration-json", str(calibration_json),
             "--expected-dice-min", str(args.calibration_expected_dice_min),
             "--polypgen-expected-dice-min", str(args.calibration_polypgen_expected_dice_min),
@@ -1512,7 +1693,7 @@ def main():
             tight_aug_manifest = round1_filter_dir / "selected_manifest_refresh_plus_tight.csv"
             total_n, added_n = _augment_manifest_with_ids(
                 base_manifest=str(round1_selected_for_refresh),
-                source_manifest=str(round1 / "pseudo" / "pseudo_candidates_manifest.csv"),
+                source_manifest=str(round1_candidates_manifest_for_filter),
                 add_ids=tight_keep_ids,
                 output_manifest=str(tight_aug_manifest),
             )
@@ -1524,8 +1705,154 @@ def main():
                 f"refresh_manifest_rows={total_n} manifest={tight_aug_manifest}"
             )
 
+    if bool(args.enable_student_bridge) and round1_selected_for_refresh.exists():
+        bridge_dir = round1 / "bridge"
+        bridge_dir.mkdir(parents=True, exist_ok=True)
+        bridge_train_manifest = bridge_dir / "student_bridge_manifest.csv"
+        bridge_score_csv = bridge_dir / "bridge_scores.csv"
+        bridge_refresh_manifest = bridge_dir / "selected_manifest_bridge_refresh.csv"
+        original_localizer_ckpt = Path(args.box_localizer_checkpoint)
+        original_refresh_manifest = round1_selected_for_refresh
+        try:
+            _build_student_manifest(
+                base_manifest=data_manifest_effective,
+                selected_manifests=[str(round1_selected_for_student)],
+                output=str(bridge_train_manifest),
+            )
+            _run_if_outputs_missing(
+                step_name="student_bridge_train",
+                done_paths=[student_bridge_ckpt_path],
+                cmd=[
+                    args.python_exec,
+                    "train.py",
+                    "--config",
+                    args.student_bridge_config,
+                    "--mode",
+                    "student_with_pseudo_distill",
+                    "--data-manifest",
+                    str(bridge_train_manifest),
+                    "--manifest-mode",
+                    "only",
+                    "--epochs",
+                    str(args.student_bridge_epochs),
+                    "--lambda-sup",
+                    "1.0",
+                    "--lambda-pseudo",
+                    "0.3",
+                    "--save-path",
+                    str(student_bridge_ckpt_path),
+                    "--run-name",
+                    "student_r1_bridge",
+                    "--num-workers",
+                    str(args.train_num_workers),
+                ],
+            )
+            if student_bridge_ckpt_path.exists():
+                bridge_ckpt_effective = str(student_bridge_ckpt_path)
+                round2_localizer_ckpt = student_bridge_ckpt_path
+
+            _run_if_outputs_missing(
+                step_name="student_bridge_score",
+                done_paths=[bridge_score_csv, bridge_refresh_manifest],
+                cmd=[
+                    args.python_exec,
+                    "tools/score_student_bridge.py",
+                    "--input-manifest",
+                    str(round1_selected_for_refresh),
+                    "--checkpoint",
+                    str(student_bridge_ckpt_path),
+                    "--output-score-csv",
+                    str(bridge_score_csv),
+                    "--output-selected-manifest",
+                    str(bridge_refresh_manifest),
+                    "--min-teacher-quality",
+                    str(args.student_bridge_min_teacher_quality),
+                    "--min-conf",
+                    str(args.student_bridge_min_conf),
+                    "--min-iou",
+                    str(args.student_bridge_min_iou),
+                    "--keep-ratio",
+                    str(args.student_bridge_keep_ratio),
+                ],
+            )
+            if bridge_score_csv.exists():
+                bridge_input_n = int(len(_read_csv(str(bridge_score_csv))))
+            if bridge_refresh_manifest.exists():
+                bridge_rows = _read_csv(str(bridge_refresh_manifest))
+                bridge_kept_n = int(len(bridge_rows))
+                if bridge_rows:
+                    round1_selected_for_refresh = bridge_refresh_manifest
+            print(
+                "[student bridge] "
+                f"input={bridge_input_n} kept={bridge_kept_n} "
+                f"refresh_manifest={round1_selected_for_refresh}"
+            )
+        except Exception as e:
+            bridge_ckpt_effective = ""
+            bridge_input_n = 0
+            bridge_kept_n = 0
+            round2_localizer_ckpt = original_localizer_ckpt
+            round1_selected_for_refresh = original_refresh_manifest
+            print(
+                "[student bridge] warning: failed, fallback to original localizer/refresh manifest. "
+                f"error={e}"
+            )
+
+    if bool(args.enable_round1_local_refine) and round1_selected_for_refresh.exists():
+        refine_dir = round1 / ("bridge" if bool(args.enable_student_bridge) else "refine")
+        refine_dir.mkdir(parents=True, exist_ok=True)
+        refine_manifest = refine_dir / "selected_manifest_round1_refined.csv"
+        refine_report = refine_dir / "selected_manifest_round1_refined_report.csv"
+        refine_summary = refine_dir / "selected_manifest_round1_refined_summary.json"
+        refine_ckpt = Path(bridge_ckpt_effective) if str(bridge_ckpt_effective).strip() else Path(args.box_localizer_checkpoint)
+        if refine_ckpt.exists():
+            _run_if_outputs_missing(
+                step_name="round1_local_refine",
+                done_paths=[refine_manifest, refine_summary],
+                cmd=[
+                    args.python_exec,
+                    "tools/refine_round1_with_student.py",
+                    "--input-manifest",
+                    str(round1_selected_for_refresh),
+                    "--checkpoint",
+                    str(refine_ckpt),
+                    "--required-train-mode",
+                    "off",
+                    "--output-manifest",
+                    str(refine_manifest),
+                    "--output-report-csv",
+                    str(refine_report),
+                    "--output-summary-json",
+                    str(refine_summary),
+                    "--high-conf-threshold",
+                    str(args.local_refine_high_conf),
+                    "--max-disagree",
+                    str(args.local_refine_max_disagree),
+                    "--soft-sigma",
+                    str(args.local_refine_soft_sigma),
+                    "--min-boundary-quality-gain",
+                    str(args.local_refine_min_boundary_quality_gain),
+                    "--min-iou-keep",
+                    str(args.local_refine_min_iou_keep),
+                    "--min-component-area-ratio",
+                    str(args.round1_post_min_component_area_ratio),
+                    "--keep-max-components",
+                    str(args.round1_post_keep_max_components),
+                ],
+            )
+            if refine_manifest.exists():
+                refine_rows = _read_csv(str(refine_manifest))
+                if refine_rows:
+                    round1_selected_for_refresh = refine_manifest
+            round1_local_refine_manifest = str(round1_selected_for_refresh)
+            round1_local_refine_summary = str(refine_summary)
+            print(f"[round1 local refine] refresh_manifest={round1_selected_for_refresh} summary={refine_summary}")
+        else:
+            print(f"[round1 local refine] skipped (checkpoint missing): {refine_ckpt}")
+
     teacher_for_round2 = teacher_r0
     if teacher_refresh and round1_selected_for_refresh.exists():
+        _require_soft_edge_artifacts(str(round1_selected_for_refresh), only_pseudo=True)
         teacher_train_manifest = round1 / "teacher_round1_manifest.csv"
         refresh_keep_subsets = {
             s.strip()
@@ -1535,7 +1862,7 @@ def main():
         if not refresh_keep_subsets:
             refresh_keep_subsets = {"L_small"}
         _merge_teacher_manifest(
-            args.data_manifest,
+            data_manifest_effective,
             str(round1_selected_for_refresh),
             str(teacher_train_manifest),
             keep_subsets=refresh_keep_subsets,
@@ -1558,7 +1885,50 @@ def main():
         )
         teacher_for_round2 = teacher_r1
 
-    manifest_for_round2 = str(round1_remaining_manifest) if round1_remaining_manifest.exists() else args.data_manifest
+    if bool(args.stop_after_round1_refresh):
+        flywheel_gallery = _build_flywheel_gallery(
+            round_quality_csvs=[(1, str(round1_quality_csv_for_filter))],
+            output_html=str(work / "all_pseudo_masks_gallery_round1_only.html"),
+        )
+        summary = {
+            "run_root": str(work),
+            "stopped_after_round1_refresh": True,
+            "data_manifest_effective": str(data_manifest_effective),
+            "teacher_r0": str(teacher_r0),
+            "teacher_r1": str(teacher_r1) if teacher_refresh else str(teacher_r0),
+            "teacher_for_round2": str(teacher_for_round2),
+            "round1_selected_manifest": str(round1_selected_manifest),
+            "round1_selected_for_refresh": str(round1_selected_for_refresh),
+            "round1_selected_for_student": str(round1_selected_for_student),
+            "round1_id_filter": str(round1_id_filter_for_pseudo),
+            "round2_id_filter": str(args.round2_id_filter or ""),
+            "round1_quality_csv_for_filter": str(round1_quality_csv_for_filter),
+            "round1_candidates_manifest_for_filter": str(round1_candidates_manifest_for_filter),
+            "round1_postprocess_enabled": bool(args.round1_postprocess),
+            "round1_postprocess_quality_csv": str(round1_postprocess_quality_csv),
+            "round1_postprocess_manifest": str(round1_postprocess_manifest),
+            "round1_local_refine_enabled": bool(args.enable_round1_local_refine),
+            "round1_local_refine_manifest": str(round1_local_refine_manifest),
+            "round1_local_refine_summary": str(round1_local_refine_summary),
+            "enable_student_bridge": bool(args.enable_student_bridge),
+            "num_bridge_input": int(bridge_input_n),
+            "num_bridge_kept": int(bridge_kept_n),
+            "bridge_keep_ratio": float(bridge_kept_n) / float(max(1, bridge_input_n)),
+            "bridge_ckpt": str(bridge_ckpt_effective),
+            "box_localizer_checkpoint_effective_round2": str(round2_localizer_ckpt),
+            "val_ids_file": str(val_ids_file),
+            "flywheel_mask_gallery_html": str(flywheel_gallery),
+            "stop_after_round1_refresh": bool(args.stop_after_round1_refresh),
+            "student_manifest": "",
+            "round2_selected_manifest": "",
+            "round2_selected_for_student": "",
+            "round2_hard_masks_dir": str(round2 / "pseudo" / "hard_masks"),
+        }
+        (work / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        return
+
+    manifest_for_round2 = str(round1_remaining_manifest) if round1_remaining_manifest.exists() else data_manifest_effective
     round2_manual_dir = round2 / "manual"
     round2_manual_dir.mkdir(parents=True, exist_ok=True)
     round2_box_template = round2_manual_dir / "box_review_template.csv"
@@ -1567,10 +1937,10 @@ def main():
     round2_mask_csv = _resolve_manual_csv(args.manual_mask_review_csv_round2, round2_manual_dir / "mask_review.csv")
     round2_mask_summary = round2_manual_dir / "qa_summary.json"
     round2_proposal_json_for_pseudo = str(args.round2_proposal_json or "")
-    round2_id_filter_for_pseudo = ""
+    round2_id_filter_for_pseudo = str(args.round2_id_filter or "")
 
     if manual_enabled and box_count > 0:
-        localizer_ckpt = Path(args.box_localizer_checkpoint)
+        localizer_ckpt = Path(round2_localizer_ckpt)
         if not localizer_ckpt.exists():
             raise RuntimeError(f"Missing --box-localizer-checkpoint: {localizer_ckpt}")
         round2_auto_prop_json = round2_manual_dir / "auto_proposals.json"
@@ -1797,7 +2167,7 @@ def main():
 
     flywheel_gallery = _build_flywheel_gallery(
         round_quality_csvs=[
-            (1, str(round1 / "pseudo" / "pseudo_quality.csv")),
+            (1, str(round1_quality_csv_for_filter)),
             (2, str(round2 / "pseudo" / "pseudo_quality.csv")),
         ],
         output_html=str(work / "all_pseudo_masks_gallery.html"),
@@ -1805,7 +2175,7 @@ def main():
 
     student_manifest = work / "student_manifest.csv"
     _build_student_manifest(
-        base_manifest=args.data_manifest,
+        base_manifest=data_manifest_effective,
         selected_manifests=[str(round1_selected_for_student), str(round2_selected_for_student)],
         output=str(student_manifest),
     )
@@ -1822,6 +2192,8 @@ def main():
 
     summary = {
         "run_root": str(work),
+        "stopped_after_round1_refresh": False,
+        "data_manifest_effective": str(data_manifest_effective),
         "teacher_r0": str(teacher_r0),
         "teacher_r1": str(teacher_r1) if teacher_refresh else str(teacher_r0),
         "lora_qc_metrics": lora_qc_metrics,
@@ -1847,6 +2219,7 @@ def main():
         "pseudo_auto_proposal_mode_effective": str(effective_auto_proposal_mode),
         "pseudo_proposal_mix_mode": str(args.pseudo_proposal_mix_mode),
         "pseudo_proposal_mix_mode_effective": str(effective_mix_mode),
+        "pseudo_fallback_full_image": bool(args.pseudo_fallback_full_image),
         "teacher_subset_filter": str(args.teacher_subset_filter),
         "teacher_refresh_subset_filter": str(args.teacher_refresh_subset_filter),
         "lora_qc_subset_filter": str(args.lora_qc_subset_filter),
@@ -1871,6 +2244,7 @@ def main():
         "lora_box_jitter_shift": float(args.lora_box_jitter_shift),
         "lora_box_full_image_prob": float(args.lora_box_full_image_prob),
         "box_localizer_checkpoint": str(args.box_localizer_checkpoint),
+        "box_localizer_checkpoint_effective_round2": str(round2_localizer_ckpt),
         "box_required_train_mode": str(args.box_required_train_mode),
         "box_review_polypgen_min": int(args.box_review_polypgen_min),
         "pseudo_proposal_jitter_scales": str(args.pseudo_proposal_jitter_scales),
@@ -1893,6 +2267,17 @@ def main():
         "round1_selected_manifest": str(round1_selected_manifest),
         "round1_selected_for_refresh": str(round1_selected_for_refresh),
         "round1_selected_for_student": str(round1_selected_for_student),
+        "round1_id_filter": str(round1_id_filter_for_pseudo),
+        "round1_quality_csv_for_filter": str(round1_quality_csv_for_filter),
+        "round1_candidates_manifest_for_filter": str(round1_candidates_manifest_for_filter),
+        "round1_postprocess_enabled": bool(args.round1_postprocess),
+        "round1_postprocess_quality_csv": str(round1_postprocess_quality_csv),
+        "round1_postprocess_manifest": str(round1_postprocess_manifest),
+        "round1_local_refine_enabled": bool(args.enable_round1_local_refine),
+        "round1_local_refine_manifest": str(round1_local_refine_manifest),
+        "round1_local_refine_summary": str(round1_local_refine_summary),
+        "stop_after_round1_refresh": bool(args.stop_after_round1_refresh),
+        "round2_id_filter": str(round2_id_filter_for_pseudo),
         "round2_selected_manifest": str(round2_selected_manifest),
         "round2_selected_for_student": str(round2_selected_for_student),
         "round1_hard_masks_dir": str(round1 / "pseudo" / "hard_masks"),
@@ -1903,6 +2288,12 @@ def main():
         "round2_manual_mask_template": str(round2_mask_template),
         "flywheel_mask_gallery_html": flywheel_gallery,
         "student_manifest": str(student_manifest),
+        "enable_student_bridge": bool(args.enable_student_bridge),
+        "num_bridge_input": int(bridge_input_n),
+        "num_bridge_kept": int(bridge_kept_n),
+        "bridge_keep_ratio": float(bridge_kept_n) / float(max(1, bridge_input_n)),
+        "bridge_ckpt": str(bridge_ckpt_effective),
+        "val_ids_file": str(val_ids_file),
     }
     (work / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     print(json.dumps(summary, indent=2, ensure_ascii=False))
