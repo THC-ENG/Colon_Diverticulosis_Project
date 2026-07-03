@@ -10,6 +10,9 @@ scipy>=1.10
 torch>=2.1
 torchvision>=0.16
 tensorboard>=2.14
+timm>=0.9
+albumentations>=1.4
+segmentation-models-pytorch>=0.3
 
 # SAM/MedSAM import used by:
 # from segment_anything import SamPredictor, sam_model_registry

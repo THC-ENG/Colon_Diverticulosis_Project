@@ -321,8 +321,10 @@ class StudentCompositeLoss(nn.Module):
             l_edge = _safe_weighted_mean(edge_ps[edge_sel], edge_w[edge_sel])
 
         l_soft = torch.zeros((), dtype=seg_logits.dtype, device=seg_logits.device)
+        # Avoid building the distillation graph while its scheduled weight is zero.
+        compute_distill = lw_distill > 0.0
         soft_sel = has_distill_soft > 0.5
-        if soft_sel.any():
+        if compute_distill and soft_sel.any():
             t = max(1e-6, self.distill_temperature)
             s_prob = torch.sigmoid(seg_logits / t)
             teacher_soft = torch.clamp(distill_soft, min=1e-4, max=1.0 - 1e-4)
@@ -333,7 +335,7 @@ class StudentCompositeLoss(nn.Module):
 
         l_edge_distill = torch.zeros((), dtype=seg_logits.dtype, device=seg_logits.device)
         edge_distill_sel = has_distill_edge > 0.5
-        if edge_distill_sel.any():
+        if compute_distill and edge_distill_sel.any():
             edge_distill_ps = _reduce_per_sample(F.l1_loss(pred_edge, distill_edge, reduction="none"))
             l_edge_distill = edge_distill_ps[edge_distill_sel].mean()
 

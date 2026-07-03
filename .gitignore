@@ -87,3 +87,4 @@ pytest_cache/
 external_models/
 _trash_to_review/
 paper/
+/*.pdf

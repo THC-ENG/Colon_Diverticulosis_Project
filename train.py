@@ -414,6 +414,8 @@ def _run_epoch(model, loader, criterion, aux_criterion, optimizer, scaler, args,
         t[k] = 0.0
     n = 0
     ratio = float(epoch_idx) / float(max(1, args.epochs - 1))
+    _, _, distill_start = _parse_schedule(args.schedule_milestones)
+    need_distill = bool(args.use_distill and args.lambda_distill > 0.0 and ratio >= distill_start)
 
     for batch in tqdm(loader, leave=False):
         imgs = batch["image"].to(args.device)
@@ -424,16 +426,24 @@ def _run_epoch(model, loader, criterion, aux_criterion, optimizer, scaler, args,
                 seg_logits, b_logits, aux_logits = _parse_outputs(model(imgs))
                 if isinstance(criterion, StudentCompositeLoss):
                     signals = {s.strip().lower() for s in str(args.distill_signals).split(",") if s.strip()}
-                    has_soft = batch["has_distill_soft"].to(args.device) if "softmask" in signals else torch.zeros_like(batch["has_distill_soft"]).to(args.device)
-                    has_edge = batch["has_distill_edge"].to(args.device) if "edge" in signals else torch.zeros_like(batch["has_distill_edge"]).to(args.device)
+                    if need_distill:
+                        has_soft = batch["has_distill_soft"].to(args.device) if "softmask" in signals else torch.zeros_like(batch["has_distill_soft"]).to(args.device)
+                        has_edge = batch["has_distill_edge"].to(args.device) if "edge" in signals else torch.zeros_like(batch["has_distill_edge"]).to(args.device)
+                        distill_soft = batch["distill_soft"].to(args.device)
+                        distill_edge = batch["distill_edge"].to(args.device)
+                    else:
+                        has_soft = torch.zeros_like(batch["has_distill_soft"]).to(args.device)
+                        has_edge = torch.zeros_like(batch["has_distill_edge"]).to(args.device)
+                        distill_soft = torch.zeros_like(masks)
+                        distill_edge = torch.zeros_like(masks)
                     loss, stats = criterion(
                         seg_logits=seg_logits,
                         masks=masks,
                         is_labeled=batch["is_labeled"].to(args.device),
                         is_pseudo=batch["is_pseudo"].to(args.device),
                         pseudo_weight=batch["pseudo_weight"].to(args.device),
-                        distill_soft=batch["distill_soft"].to(args.device),
-                        distill_edge=batch["distill_edge"].to(args.device),
+                        distill_soft=distill_soft,
+                        distill_edge=distill_edge,
                         has_distill_soft=has_soft,
                         has_distill_edge=has_edge,
                         epoch_ratio=ratio,
