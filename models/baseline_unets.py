@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from .baseline_pranet import PraNet
 from .baseline_sanet import SANet
 from .baseline_transunet import TransUNet
+from .baseline_extra import DeepLabV3Plus, FPNResNet50, ResUNetPlusPlus, SegFormerB0
 
 
 def _norm(num_channels: int, norm_type: str = "gn") -> nn.Module:
@@ -144,4 +145,12 @@ def build_baseline_model(model_name: str, **kwargs) -> nn.Module:
         return TransUNet(**kwargs)
     if name in {"sanet", "shallowattentionnetwork"}:
         return SANet(**kwargs)
+    if name in {"deeplabv3plus", "deeplabv3+", "deeplab"}:
+        return DeepLabV3Plus(**kwargs)
+    if name in {"fpnresnet50", "fpn", "fpnr50"}:
+        return FPNResNet50(**kwargs)
+    if name in {"resunet++", "resunetplusplus", "resunetpp"}:
+        return ResUNetPlusPlus(**kwargs)
+    if name in {"segformerb0", "segformer_b0", "segformer"}:
+        return SegFormerB0(**kwargs)
     raise ValueError(f"Unsupported local baseline model: {model_name}")

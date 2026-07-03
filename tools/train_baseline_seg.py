@@ -55,7 +55,22 @@ def _build_parser():
 
     p = argparse.ArgumentParser(description="Train local supervised segmentation baselines.")
     p.add_argument("--config", type=str, default=pre_args.config)
-    p.add_argument("--model", type=str, default=cfg.get("model", "unet"), choices=["unet", "unetpp", "pranet", "transunet", "sanet"])
+    p.add_argument(
+        "--model",
+        type=str,
+        default=cfg.get("model", "unet"),
+        choices=[
+            "unet",
+            "unetpp",
+            "pranet",
+            "transunet",
+            "sanet",
+            "deeplabv3plus",
+            "fpnresnet50",
+            "segformerb0",
+            "resunetpp",
+        ],
+    )
     p.add_argument("--base-channels", type=int, default=cfg.get("base_channels", 32))
     p.add_argument("--norm-type", type=str, default=cfg.get("norm_type", "gn"), choices=["bn", "gn"])
 
